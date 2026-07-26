@@ -7,6 +7,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 
 WORKDIR /app
 
+# CPU-only torch first - the default PyPI wheel bundles full NVIDIA CUDA runtime packages
+# (~2.7GB of nvidia-cublas/cudnn/nccl/triton/etc.) that are useless on Railway's CPU-only
+# builders and are almost certainly why the previous deploy failed (bloated multi-GB image,
+# likely OOM-killed on container start with no time to log anything). Installing this first means
+# pip sees torch as already satisfied and never pulls the GPU build when it resolves
+# sentence-transformers' dependency on it below.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -18,4 +26,6 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 COPY app ./app
 
 # Railway (and most PaaS hosts) inject $PORT at runtime - bind to it, not a hardcoded port.
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8008}
+# JSON/exec form (with an explicit shell) so SIGTERM forwards correctly on redeploy/shutdown,
+# while still allowing the ${PORT:-8008} shell substitution uvicorn's own args can't do alone.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8008}"]
