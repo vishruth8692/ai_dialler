@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AI Dialler — Telephony (Exotel)</title>
+  <style>
+    body { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.3rem; margin-bottom: 0.25rem; }
+    .sub { color: #666; font-size: 0.85rem; margin-bottom: 1rem; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1.25rem; margin-bottom: 1.25rem; }
+    .card h2 { font-size: 1rem; margin-top: 0; }
+    .msg { padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }
+    .msg.ok { background: #e6f4ea; color: #1e4620; }
+    .msg.err { background: #fdecea; color: #611a15; }
+    .checklist { list-style: none; padding: 0; margin: 0; }
+    .checklist li { padding: 0.35rem 0; font-size: 0.9rem; display: flex; align-items: center; gap: 0.5rem; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+    .dot.set { background: #1e8e3e; }
+    .dot.missing { background: #d93025; }
+    code { background: #f1f1f1; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85rem; }
+    input[type=tel] { padding: 0.6rem 0.7rem; border: 1px solid #ccc; border-radius: 6px; font-size: 0.95rem; width: 220px; }
+    button { background: #0b5fff; color: #fff; border: none; padding: 0.6rem 1.1rem; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+    button:disabled { background: #ccc; cursor: default; }
+    .hint { color: #666; font-size: 0.85rem; }
+    nav { font-size: 0.85rem; margin-bottom: 1rem; }
+    nav a { color: #0b5fff; text-decoration: none; margin-right: 1rem; }
+
+    #monitor-status { font-size: 0.85rem; color: #666; margin-bottom: 0.5rem; }
+    #monitor-status .live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #1e8e3e; margin-right: 0.4rem; animation: pulse-green 1.6s infinite; }
+    #monitor-status .idle-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #bbb; margin-right: 0.4rem; }
+    @keyframes pulse-green { 0% { box-shadow: 0 0 0 0 rgba(30,142,62,0.5); } 70% { box-shadow: 0 0 0 8px rgba(30,142,62,0); } 100% { box-shadow: 0 0 0 0 rgba(30,142,62,0); } }
+    #log { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; height: 340px; overflow-y: auto; background: #fafafa; display: flex; flex-direction: column; gap: 0.6rem; }
+    .bubble { max-width: 85%; padding: 0.55rem 0.8rem; border-radius: 12px; font-size: 0.92rem; line-height: 1.35; white-space: pre-wrap; }
+    .bot { align-self: flex-start; background: #e9e9eb; color: #1a1a1a; border-bottom-left-radius: 3px; }
+    .rider { align-self: flex-end; background: #0b5fff; color: #fff; border-bottom-right-radius: 3px; }
+    .rider.barge-in { background: #b5170f; }
+    .system { align-self: center; color: #888; font-size: 0.8rem; font-style: italic; }
+    .debug { align-self: center; background: #fff3cd; color: #664d03; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem; padding: 0.3rem 0.6rem; border-radius: 6px; max-width: 95%; white-space: pre-wrap; }
+    #answers { margin-top: 1rem; }
+    #answers h3 { font-size: 0.9rem; margin-bottom: 0.3rem; }
+    #answers ul { padding-left: 1.1rem; font-size: 0.85rem; margin: 0; }
+
+    .call-list { display: flex; flex-direction: column; }
+    .call-entry { display: flex; gap: 1.25rem; padding: 1rem 0; border-bottom: 1px solid #eee; }
+    .call-entry:last-child { border-bottom: none; }
+    .call-summary { flex: 1 1 40%; min-width: 0; }
+    .call-summary .phone { font-weight: 600; }
+    .call-summary .when { color: #666; font-size: 0.8rem; margin-bottom: 0.5rem; }
+    .call-summary .summary-text { font-size: 0.88rem; margin-top: 0.5rem; }
+    .tag-chip { display: inline-block; background: #eef2ff; color: #3730a3; border-radius: 999px; padding: 0.15rem 0.6rem; font-size: 0.75rem; margin: 0 0.3rem 0.3rem 0; }
+    .call-transcript { flex: 1 1 60%; min-width: 0; max-height: 260px; overflow-y: auto; background: #fafafa; border: 1px solid #eee; border-radius: 8px; padding: 0.75rem; display: flex; flex-direction: column; gap: 0.5rem; }
+    .call-transcript .bubble { max-width: 90%; font-size: 0.82rem; }
+    .empty { color: #888; font-style: italic; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <nav><a href="/qa">Q&amp;A content</a><a href="/chat">Text call</a><a href="/voice">Voice call</a><a href="/voice/live">Live voice call</a><a href="/telephony">Telephony (Exotel)</a></nav>
+  <h1>Telephony — Exotel (real phone calls)</h1>
+  <div class="sub">Places real outbound calls and streams them through the same conversation engine as /voice/live.</div>
+
+  {% if message %}<div class="msg ok">{{ message }}</div>{% endif %}
+  {% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+
+  <div class="card">
+    <details {{ "open" if not configured else "" }}>
+      <summary style="cursor:pointer; font-size:1rem; font-weight:600;">Setup status</summary>
+      <ul class="checklist" style="margin-top:0.75rem;">
+        {% for name, is_set in settings_status %}
+        <li><span class="dot {{ 'set' if is_set else 'missing' }}"></span> <code>{{ name }}</code> {{ 'configured' if is_set else 'missing' }}</li>
+        {% endfor %}
+      </ul>
+      {% if not configured %}
+      <p class="hint">
+        Set the missing values above in <code>.env</code>. You'll need: an Exotel account with API
+        access, TRAI DLT registration (required for commercial calling in India), a purchased Exophone
+        number, and a public HTTPS/WSS URL for this server (e.g. via <code>ngrok http 8008</code> for
+        testing) set as <code>PUBLIC_BASE_URL</code>.
+      </p>
+      {% endif %}
+    </details>
+  </div>
+
+  <div class="card">
+    <h2>Place a test call</h2>
+    {% if configured %}
+    <form action="/telephony/call" method="post">
+      <input type="tel" name="to_number" placeholder="+91XXXXXXXXXX" required>
+      <button type="submit">Call</button>
+    </form>
+    <p class="hint">Verified against a real call — audio, transcript, and barge-in all confirmed working.</p>
+    {% else %}
+    <button disabled>Call</button>
+    <p class="hint">Complete the setup checklist above first.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2 style="display:flex; align-items:center; gap:0.6rem;">
+      Live call view
+      <span id="call-number" class="hint" style="display:none; font-weight:400;"></span>
+    </h2>
+    <div id="monitor-status">Connecting...</div>
+    <div id="log"></div>
+    <div id="answers"></div>
+  </div>
+
+  <div class="card">
+    <h2>Calls made ({{ history|length }})</h2>
+    {% if not history %}
+    <p class="empty">No calls yet.</p>
+    {% else %}
+    <div class="call-list">
+      {% for call in history %}
+      <div class="call-entry">
+        <div class="call-summary">
+          <div class="phone">{{ call.phone_number or "Unknown number" }}</div>
+          <div class="when">{{ call.started_at }}</div>
+          <div>
+            {% for tag in call.tags %}<span class="tag-chip">{{ tag }}</span>{% endfor %}
+          </div>
+          <div class="summary-text">{{ call.summary }}</div>
+        </div>
+        <div class="call-transcript">
+          {% for turn in call.transcript %}
+          <div class="bubble {{ 'bot' if turn.role == 'bot' else ('rider barge-in' if turn.barge_in else 'rider') }}" style="align-self: {{ 'flex-start' if turn.role == 'bot' else 'flex-end' }};">{{ turn.text }}</div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+
+  <script>
+    // The success/error banner above comes from a query param on the POST-redirect-GET after
+    // placing a call. Left in the URL, a plain page refresh resends it and resurfaces a stale
+    // "Call placed to..." message as if a new call just happened - strip it once rendered so a
+    // refresh (or reopening this tab later) starts clean.
+    if (location.search) {
+      history.replaceState(null, "", location.pathname);
+    }
+
+    const logEl = document.getElementById("log");
+    const answersDiv = document.getElementById("answers");
+    const monitorStatus = document.getElementById("monitor-status");
+    const callNumberDiv = document.getElementById("call-number");
+
+    let currentBotBubble = null;
+
+    function addBubble(text, cls) {
+      if (!text) return null;
+      const div = document.createElement("div");
+      div.className = "bubble " + cls;
+      div.textContent = text;
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+      return div;
+    }
+
+    function addSystem(text) { addBubble(text, "system"); }
+
+    function addDebug(msg) {
+      const lines = [];
+      if (msg.tool_name) lines.push(`tool: ${msg.tool_name}`);
+      if (msg.answer_summary) lines.push(`captured: "${msg.answer_summary}"`);
+      if (msg.retrieved_context && msg.retrieved_context.length) {
+        lines.push("context used: " + msg.retrieved_context.map(c => `"${c.question}"`).join(", "));
+      }
+      if (!lines.length) return;
+      const div = document.createElement("div");
+      div.className = "bubble debug";
+      div.textContent = lines.join("\n");
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    function renderAnswers(answers) {
+      if (!answers || !answers.length) { answersDiv.innerHTML = ""; return; }
+      const items = answers.map(a => `<li><strong>${escapeHtml(a.question)}</strong>: ${escapeHtml(a.answer)}</li>`).join("");
+      answersDiv.innerHTML = `<h3>Collected answers</h3><ul>${items}</ul>`;
+    }
+
+    function connectMonitor() {
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${protocol}//${location.host}/telephony/monitor-ws`);
+
+      ws.onopen = () => {
+        monitorStatus.innerHTML = '<span class="idle-dot"></span>No call in progress';
+      };
+      ws.onclose = () => {
+        monitorStatus.textContent = "Disconnected — reconnecting...";
+        setTimeout(connectMonitor, 2000);
+      };
+      ws.onerror = () => { ws.close(); };
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        switch (msg.type) {
+          case "call_lifecycle":
+            if (msg.status === "started") {
+              logEl.innerHTML = "";
+              answersDiv.innerHTML = "";
+              currentBotBubble = null;
+              monitorStatus.innerHTML = '<span class="live-dot"></span>Call in progress';
+              callNumberDiv.style.display = "none";
+              callNumberDiv.textContent = "";
+              addSystem("Call started");
+            } else if (msg.status === "ended") {
+              monitorStatus.innerHTML = '<span class="idle-dot"></span>No call in progress';
+              callNumberDiv.style.display = "none";
+              addSystem("Call ended");
+            }
+            break;
+          case "call_info":
+            if (msg.phone_number) {
+              callNumberDiv.textContent = `(${msg.phone_number})`;
+              callNumberDiv.style.display = "inline";
+            }
+            break;
+          case "bot_text_chunk":
+            if (!currentBotBubble) {
+              currentBotBubble = document.createElement("div");
+              currentBotBubble.className = "bubble bot";
+              logEl.appendChild(currentBotBubble);
+            }
+            currentBotBubble.textContent += (currentBotBubble.textContent ? " " : "") + msg.text;
+            logEl.scrollTop = logEl.scrollHeight;
+            break;
+          case "transcript":
+            addBubble(msg.text, msg.barge_in ? "rider barge-in" : "rider");
+            break;
+          case "control":
+            addDebug(msg);
+            renderAnswers(msg.collected_answers);
+            break;
+          case "reply_done":
+            currentBotBubble = null;
+            break;
+          case "bot_state":
+            // no dedicated UI for this on the monitor - the bubbles already show what's happening
+            break;
+        }
+      };
+    }
+
+    connectMonitor();
+  </script>
+</body>
+</html>

@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AI Dialler — Q&amp;A Content</title>
+  <style>
+    body { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; }
+    .msg { padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; }
+    .msg.ok { background: #e6f4ea; color: #1e4620; }
+    .msg.err { background: #fdecea; color: #611a15; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+    th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #eee; font-size: 0.9rem; vertical-align: top; }
+    th { color: #555; font-weight: 600; }
+    .lang { text-transform: capitalize; color: #666; font-size: 0.8rem; }
+    input[type=file] { margin-bottom: 0.75rem; }
+    button { background: #1a1a1a; color: #fff; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; }
+    .hint { color: #666; font-size: 0.85rem; }
+    .empty { color: #888; font-style: italic; }
+  </style>
+</head>
+<body>
+  <nav style="font-size:0.85rem;margin-bottom:1rem;"><a href="/qa" style="color:#0b5fff;text-decoration:none;margin-right:1rem;">Q&amp;A content</a><a href="/chat" style="color:#0b5fff;text-decoration:none;margin-right:1rem;">Text call</a><a href="/voice" style="color:#0b5fff;text-decoration:none;margin-right:1rem;">Voice call</a><a href="/voice/live" style="color:#0b5fff;text-decoration:none;margin-right:1rem;">Live voice call</a><a href="/telephony" style="color:#0b5fff;text-decoration:none;margin-right:1rem;">Telephony (Exotel)</a></nav>
+  <h1>Delivery Partner Feedback — Q&amp;A Content</h1>
+
+  {% if message %}<div class="msg ok">{{ message }}</div>{% endif %}
+  {% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+
+  <div class="card">
+    <form action="/qa/upload" method="post" enctype="multipart/form-data">
+      <p class="hint">Upload a CSV with columns <code>question,answer</code> (optional <code>language</code>,
+      <code>type</code>). <code>type</code> is <code>survey</code> (asked aloud, in order - default
+      if omitted) or <code>faq</code> (only used to answer side questions, never asked aloud).
+      This replaces whatever Q&amp;A content is currently loaded.</p>
+      <input type="file" name="file" accept=".csv" required>
+      <br>
+      <button type="submit">Upload &amp; Load</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:1.1rem;">Currently loaded ({{ pairs|length }})</h2>
+    {% if pairs %}
+    <table>
+      <thead><tr><th>Question</th><th>Answer</th><th>Language</th><th>Type</th></tr></thead>
+      <tbody>
+        {% for p in pairs %}
+        <tr>
+          <td>{{ p.question }}</td>
+          <td>{{ p.answer }}</td>
+          <td class="lang">{{ p.language or "—" }}</td>
+          <td class="lang">{{ p.type }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="empty">No Q&amp;A content loaded yet — upload a CSV above.</p>
+    {% endif %}
+  </div>
+</body>
+</html>

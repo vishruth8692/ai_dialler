@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AI Dialler — Live Voice Call</title>
+  <style>
+    body { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.3rem; margin-bottom: 0.25rem; }
+    .sub { color: #666; font-size: 0.85rem; margin-bottom: 0.35rem; }
+    .sub.warn { color: #9a6700; }
+    #log { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; height: 380px; overflow-y: auto; background: #fafafa; display: flex; flex-direction: column; gap: 0.6rem; margin-top: 0.75rem; }
+    .bubble { max-width: 80%; padding: 0.55rem 0.8rem; border-radius: 12px; font-size: 0.92rem; line-height: 1.35; white-space: pre-wrap; }
+    .bot { align-self: flex-start; background: #e9e9eb; color: #1a1a1a; border-bottom-left-radius: 3px; }
+    .bot.interrupted-context { opacity: 0.55; text-decoration: line-through; }
+    .rider { align-self: flex-end; background: #0b5fff; color: #fff; border-bottom-right-radius: 3px; }
+    .rider.barge-in { background: #b5170f; }
+    .system { align-self: center; color: #888; font-size: 0.8rem; font-style: italic; }
+    .debug { align-self: center; background: #fff3cd; color: #664d03; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem; padding: 0.3rem 0.6rem; border-radius: 6px; max-width: 95%; white-space: pre-wrap; }
+    .controls { display: flex; align-items: center; gap: 0.75rem; margin-top: 1rem; }
+    #mic-indicator { width: 84px; height: 84px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 1.8rem; background: #ccc; color: #fff; transition: background 0.2s; }
+    #mic-indicator.state-listening { background: #0b5fff; animation: pulse-blue 1.6s infinite; }
+    #mic-indicator.state-speaking { background: #6b7280; }
+    @keyframes pulse-blue { 0% { box-shadow: 0 0 0 0 rgba(11,95,255,0.4); } 70% { box-shadow: 0 0 0 14px rgba(11,95,255,0); } 100% { box-shadow: 0 0 0 0 rgba(11,95,255,0); } }
+    #status { font-size: 0.9rem; color: #444; min-width: 200px; }
+    button#call-btn { background: #0b5fff; color: #fff; border: none; padding: 0.7rem 1.3rem; border-radius: 8px; cursor: pointer; font-size: 0.95rem; }
+    #answers { margin-top: 1.25rem; }
+    #answers h2 { font-size: 1rem; }
+    #answers ul { padding-left: 1.1rem; font-size: 0.88rem; }
+    nav { font-size: 0.85rem; margin-bottom: 1rem; }
+    nav a { color: #0b5fff; text-decoration: none; margin-right: 1rem; }
+  </style>
+</head>
+<body>
+  <nav><a href="/qa">Q&amp;A content</a><a href="/chat">Text call</a><a href="/voice">Voice call</a><a href="/voice/live">Live voice call</a><a href="/telephony">Telephony (Exotel)</a></nav>
+  <h1>Live voice call (streaming, with barge-in)</h1>
+  <div class="sub">Mic is always on once the call starts - talk over the bot for 5+ seconds straight and it stops to listen. A quick "okay" won't interrupt it.</div>
+  <div class="sub warn">Echo cancellation reduces the bot's own voice being picked up as an interruption, but isn't perfect - headphones give the most reliable experience.</div>
+
+  <div class="controls">
+    <div id="mic-indicator">🎤</div>
+    <div id="status">Not connected</div>
+    <button id="call-btn">Start call</button>
+  </div>
+
+  <div id="log"></div>
+
+  <div id="answers"></div>
+
+  <script>
+    const log = document.getElementById("log");
+    const micIndicator = document.getElementById("mic-indicator");
+    const statusEl = document.getElementById("status");
+    const callBtn = document.getElementById("call-btn");
+    const answersDiv = document.getElementById("answers");
+
+    let ws = null;
+    let micContext = null;
+    let workletNode = null;
+    let micStream = null;
+
+    let playContext = null;
+    let nextPlayTime = 0;
+    let activeSources = [];
+    const PLAY_SAMPLE_RATE = 24000; // must match SarvamTTSStream's default sample_rate
+
+    let currentBotBubble = null;
+
+    function setStatus(text) { statusEl.textContent = text; }
+
+    function setMicState(state) {
+      micIndicator.className = state ? `state-${state}` : "";
+    }
+
+    function addBubble(text, cls) {
+      if (!text) return null;
+      const div = document.createElement("div");
+      div.className = "bubble " + cls;
+      div.textContent = text;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+      return div;
+    }
+
+    function addSystem(text) { addBubble(text, "system"); }
+
+    function addDebug(msg) {
+      const lines = [];
+      if (msg.tool_name) lines.push(`tool: ${msg.tool_name}`);
+      if (msg.answer_summary) lines.push(`captured: "${msg.answer_summary}"`);
+      if (msg.retrieved_context && msg.retrieved_context.length) {
+        lines.push("context used: " + msg.retrieved_context.map(c => `"${c.question}"`).join(", "));
+      }
+      if (!lines.length) return;
+      const div = document.createElement("div");
+      div.className = "bubble debug";
+      div.textContent = lines.join("\n");
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    function renderAnswers(answers) {
+      if (!answers || !answers.length) { answersDiv.innerHTML = ""; return; }
+      const items = answers.map(a => `<li><strong>${escapeHtml(a.question)}</strong>: ${escapeHtml(a.answer)}</li>`).join("");
+      answersDiv.innerHTML = `<h2>Collected answers</h2><ul>${items}</ul>`;
+    }
+
+    // ---- Playback: raw PCM16LE chunks -> scheduled AudioBuffers, gapless regardless of arrival timing ----
+    function playPCMChunk(arrayBuffer) {
+      const int16 = new Int16Array(arrayBuffer);
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+
+      const buffer = playContext.createBuffer(1, float32.length, PLAY_SAMPLE_RATE);
+      buffer.getChannelData(0).set(float32);
+
+      const source = playContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(playContext.destination);
+      source.onended = () => {
+        activeSources = activeSources.filter((s) => s !== source);
+      };
+      activeSources.push(source);
+
+      nextPlayTime = Math.max(nextPlayTime, playContext.currentTime);
+      source.start(nextPlayTime);
+      nextPlayTime += buffer.duration;
+    }
+
+    function stopAllPlayback() {
+      for (const source of activeSources) {
+        try { source.stop(); } catch (e) { /* already finished */ }
+      }
+      activeSources = [];
+      nextPlayTime = playContext.currentTime;
+    }
+
+    // ---- Call lifecycle: one click starts WS + continuous mic capture together ----
+    async function startCall() {
+      log.innerHTML = "";
+      answersDiv.innerHTML = "";
+      currentBotBubble = null;
+      callBtn.disabled = true;
+      setStatus("Dialling...");
+      addSystem("Dialling...");
+
+      playContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: PLAY_SAMPLE_RATE });
+      nextPlayTime = playContext.currentTime;
+      activeSources = [];
+
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(`${protocol}//${location.host}/voice/ws`);
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = async () => {
+        setStatus("Connected - starting mic...");
+        await startMic();
+      };
+      ws.onmessage = handleMessage;
+      ws.onerror = () => addSystem("WebSocket connection error.");
+      ws.onclose = () => {
+        setStatus("Call ended");
+        setMicState(null);
+        stopMic();
+        callBtn.disabled = false;
+        callBtn.textContent = "Start new call";
+      };
+    }
+
+    function handleMessage(event) {
+      if (event.data instanceof ArrayBuffer) {
+        playPCMChunk(event.data);
+        return;
+      }
+
+      const msg = JSON.parse(event.data);
+      switch (msg.type) {
+        case "bot_text_chunk":
+          if (!currentBotBubble) {
+            // Not using addBubble() here - it no-ops on empty text, but we need to create an
+            // empty bubble upfront and grow it as chunks arrive.
+            currentBotBubble = document.createElement("div");
+            currentBotBubble.className = "bubble bot";
+            log.appendChild(currentBotBubble);
+          }
+          currentBotBubble.textContent += (currentBotBubble.textContent ? " " : "") + msg.text;
+          log.scrollTop = log.scrollHeight;
+          break;
+        case "transcript":
+          addBubble(msg.text, msg.barge_in ? "rider barge-in" : "rider");
+          break;
+        case "control":
+          addDebug(msg);
+          renderAnswers(msg.collected_answers);
+          break;
+        case "stop_audio":
+          stopAllPlayback();
+          if (currentBotBubble) {
+            currentBotBubble.classList.add("interrupted-context");
+            currentBotBubble = null;
+          }
+          addSystem("You interrupted - go ahead");
+          break;
+        case "reply_done":
+          currentBotBubble = null;
+          break;
+        case "bot_state":
+          setMicState(msg.state); // "speaking" or "listening" - mic itself never gets disabled
+          setStatus(msg.state === "speaking" ? "Bot is speaking..." : "Listening...");
+          break;
+        case "error":
+          addSystem(msg.message || "Something went wrong.");
+          break;
+      }
+    }
+
+    // ---- Mic capture: continuous for the whole call, no click-to-talk ----
+    async function startMic() {
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+      } catch (e) {
+        addSystem("Microphone access denied or unavailable: " + e.message);
+        return;
+      }
+
+      micContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      await micContext.audioWorklet.addModule("/static/pcm-worklet.js");
+
+      const source = micContext.createMediaStreamSource(micStream);
+      workletNode = new AudioWorkletNode(micContext, "pcm-worklet");
+      workletNode.port.onmessage = (e) => {
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data);
+      };
+      source.connect(workletNode);
+      // Intentionally not connected to destination - we don't want to hear our own mic.
+    }
+
+    function stopMic() {
+      if (workletNode) { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }
+      if (micContext) { micContext.close(); micContext = null; }
+      if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+    }
+
+    callBtn.addEventListener("click", () => {
+      stopMic();
+      if (ws) ws.close();
+      startCall();
+    });
+  </script>
+</body>
+</html>

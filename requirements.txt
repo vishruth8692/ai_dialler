@@ -1,0 +1,15 @@
+# Phases 0-2 (no paid speech/telephony accounts needed)
+fastapi
+uvicorn[standard]
+python-multipart
+jinja2
+python-dotenv
+anthropic
+chromadb
+sentence-transformers
+
+# Phase 3 (Sarvam STT/TTS)
+requests
+
+# Phase 4 (Exotel telephony)
+websockets

@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AI Dialler — Mock Call</title>
+  <style>
+    body { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.3rem; margin-bottom: 0.25rem; }
+    .sub { color: #666; font-size: 0.85rem; margin-bottom: 1rem; }
+    #log { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; height: 420px; overflow-y: auto; background: #fafafa; display: flex; flex-direction: column; gap: 0.6rem; }
+    .bubble { max-width: 80%; padding: 0.55rem 0.8rem; border-radius: 12px; font-size: 0.92rem; line-height: 1.35; white-space: pre-wrap; }
+    .bot { align-self: flex-start; background: #e9e9eb; color: #1a1a1a; border-bottom-left-radius: 3px; }
+    .rider { align-self: flex-end; background: #0b5fff; color: #fff; border-bottom-right-radius: 3px; }
+    .system { align-self: center; color: #888; font-size: 0.8rem; font-style: italic; }
+    .debug { align-self: center; background: #fff3cd; color: #664d03; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem; padding: 0.3rem 0.6rem; border-radius: 6px; max-width: 95%; white-space: pre-wrap; }
+    .row { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
+    input[type=text] { flex: 1; padding: 0.6rem 0.7rem; border: 1px solid #ccc; border-radius: 6px; font-size: 0.95rem; }
+    button { background: #1a1a1a; color: #fff; border: none; padding: 0.6rem 1rem; border-radius: 6px; cursor: pointer; }
+    button.secondary { background: #eee; color: #1a1a1a; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    #answers { margin-top: 1.25rem; }
+    #answers h2 { font-size: 1rem; }
+    #answers ul { padding-left: 1.1rem; font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+  <nav style="font-size:0.85rem;margin-bottom:1rem;"><a href="/qa" style="color:#0b5fff;text-decoration:none;margin-right:1rem;">Q&amp;A content</a><a href="/chat" style="color:#0b5fff;text-decoration:none;margin-right:1rem;">Text call</a><a href="/voice" style="color:#0b5fff;text-decoration:none;margin-right:1rem;">Voice call</a><a href="/voice/live" style="color:#0b5fff;text-decoration:none;margin-right:1rem;">Live voice call</a><a href="/telephony" style="color:#0b5fff;text-decoration:none;margin-right:1rem;">Telephony (Exotel)</a></nav>
+  <h1>Mock call with a delivery partner</h1>
+  <div class="sub">Type as the rider. The bot uses Claude + the uploaded Q&amp;A content — no telephony/audio yet.</div>
+
+  <div id="log"></div>
+
+  <div class="row">
+    <input type="text" id="input" placeholder="Type the rider's reply..." disabled>
+    <button id="send" disabled>Send</button>
+    <button id="restart" class="secondary">Start new call</button>
+  </div>
+
+  <div id="answers"></div>
+
+  <script>
+    const log = document.getElementById("log");
+    const input = document.getElementById("input");
+    const sendBtn = document.getElementById("send");
+    const restartBtn = document.getElementById("restart");
+    const answersDiv = document.getElementById("answers");
+
+    function addBubble(text, cls) {
+      const div = document.createElement("div");
+      div.className = "bubble " + cls;
+      div.textContent = text;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function addSystem(text) {
+      const div = document.createElement("div");
+      div.className = "bubble system";
+      div.textContent = text;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function addDebug(data) {
+      const lines = [];
+      if (data.tool_name) lines.push(`tool: ${data.tool_name}`);
+      if (data.answer_summary) lines.push(`captured: "${data.answer_summary}"`);
+      if (data.retrieved_context && data.retrieved_context.length) {
+        lines.push("context used: " + data.retrieved_context.map(c => `"${c.question}"`).join(", "));
+      }
+      if (!lines.length) return;
+      const div = document.createElement("div");
+      div.className = "bubble debug";
+      div.textContent = lines.join("\n");
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function renderAnswers(answers) {
+      if (!answers || !answers.length) { answersDiv.innerHTML = ""; return; }
+      const items = answers.map(a => `<li><strong>${escapeHtml(a.question)}</strong>: ${escapeHtml(a.answer)}</li>`).join("");
+      answersDiv.innerHTML = `<h2>Collected answers</h2><ul>${items}</ul>`;
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    async function safeJson(res) {
+      try {
+        return await res.json();
+      } catch (e) {
+        return { error: `Server returned ${res.status} ${res.statusText}` };
+      }
+    }
+
+    async function startCall() {
+      log.innerHTML = "";
+      answersDiv.innerHTML = "";
+      input.value = "";
+      input.disabled = true;
+      sendBtn.disabled = true;
+      addSystem("Dialling...");
+
+      try {
+        const res = await fetch("/chat/start", { method: "POST" });
+        const data = await safeJson(res);
+        if (!res.ok) {
+          addSystem(data.error || "Could not start call.");
+          return;
+        }
+        addBubble(data.reply, "bot");
+        if (!data.ended) {
+          input.disabled = false;
+          sendBtn.disabled = false;
+          input.focus();
+        } else {
+          addSystem("Call ended.");
+        }
+      } catch (e) {
+        addSystem("Network error starting call: " + e.message);
+      }
+    }
+
+    async function sendMessage() {
+      const text = input.value.trim();
+      if (!text) return;
+      addBubble(text, "rider");
+      input.value = "";
+      input.disabled = true;
+      sendBtn.disabled = true;
+
+      try {
+        const res = await fetch("/chat/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        const data = await safeJson(res);
+        if (!res.ok) {
+          addSystem(data.error || "Something went wrong.");
+          input.disabled = false;
+          sendBtn.disabled = false;
+          return;
+        }
+        addDebug(data);
+        addBubble(data.reply, "bot");
+        renderAnswers(data.collected_answers);
+
+        if (data.ended) {
+          addSystem("Call ended.");
+        } else {
+          input.disabled = false;
+          sendBtn.disabled = false;
+          input.focus();
+        }
+      } catch (e) {
+        addSystem("Network error: " + e.message);
+        input.disabled = false;
+        sendBtn.disabled = false;
+      }
+    }
+
+    sendBtn.addEventListener("click", sendMessage);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") sendMessage(); });
+    restartBtn.addEventListener("click", startCall);
+
+    startCall();
+  </script>
+</body>
+</html>

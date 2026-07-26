@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.env
+data/chroma/
+data/qa_uploads/
+data/call_history.json
+tests/
+scripts/
