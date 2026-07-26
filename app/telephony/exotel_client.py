@@ -61,6 +61,12 @@ def place_call(to_number: str) -> dict:
     base = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
     stream_url = f"{base}/telephony/exotel-stream?sample-rate=16000"
 
+    # Logged unconditionally (not just on error) since this is the one piece of information that
+    # actually explains whether Exotel was ever given a usable StreamUrl - PUBLIC_BASE_URL being
+    # empty/wrong here is invisible from Exotel's side (it just silently never connects and the
+    # call plays a fallback tone), so this needs to be visible in our own logs instead.
+    logger.info("Placing call to %s with StreamUrl=%s", to_number, stream_url)
+
     url = f"https://{EXOTEL_SUBDOMAIN}/v1/Accounts/{EXOTEL_SID}/Calls/connect.json"
     response = _session.post(
         url,
@@ -74,4 +80,5 @@ def place_call(to_number: str) -> dict:
         timeout=30,
     )
     response.raise_for_status()
+    logger.info("Exotel connect response: %s", response.text)
     return response.json()
