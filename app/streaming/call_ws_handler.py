@@ -67,6 +67,11 @@ def _normalize_for_tts(text: str) -> str:
 _TTS_PING_INTERVAL = 30  # seconds; Sarvam's TTS WS closes after 60s of inactivity otherwise
 _BARGE_IN_GRACE_S = 0.3  # ignore vad_start right as the bot starts talking (TTS-onset false trigger)
 _BARGE_IN_THRESHOLD_S = 5.0  # continuous rider speech past this while the bot talks = real interrupt
+_PAUSE_GRACE_S = 1.2  # confirmed on a real call: Sarvam's VAD reports vad_end on ANY pause, even a
+# brief mid-sentence one while the rider is still thinking - flushing immediately on every vad_end
+# cut their answer off mid-thought and had the bot reply to a fragment. Waiting this long after
+# vad_end before actually flushing gives them a beat to resume; if they do, it's folded into the
+# same continuous utterance instead of being treated as a separate, completed turn.
 _SPEAKING_TIMEOUT_S = 20.0  # safety net: normal turns finish in a few seconds. On a real call, a
 # reply whose Claude stream never emitted the ###CONTROL### block left _run_speaking stuck inside
 # drive()/forward() with no completion event ever arriving from Sarvam, wedging `speaking` as
@@ -154,6 +159,10 @@ async def _orchestrate(
     # separate state enum, so state and handle can never disagree with each other.
     speaking: Optional[SpeakingHandle] = None
     awaiting_transcript = False
+    # Pending "confirm the rider is actually done talking" timer while LISTENING - see
+    # _PAUSE_GRACE_S. Mirrors the SPEAKING-state barge_in_watchdog pattern but for the opposite
+    # direction (deciding whether OUR flush should fire, not whether an interruption should).
+    pause_watchdog: Optional[asyncio.Task] = None
     # Set when barge_in_confirmed cancels a SPEAKING handle, consumed by the next transcript so
     # its `barge_in` flag is accurate even when interrupting the greeting/fallback (which have no
     # prior user history entry for pop_pending_user_turn() to detect).
@@ -189,7 +198,10 @@ async def _orchestrate(
         remaining = handle.flushes_sent - handle.completions_seen
         await tts.drain_pending(remaining)
 
-    speaking = start_speaking(fixed_text=session.greeting(), kind="greeting")
+    t_greeting_start = time.monotonic()
+    greeting_text = session.greeting()
+    logger.info("[latency] greeting generation (Claude call): %.2fs", time.monotonic() - t_greeting_start)
+    speaking = start_speaking(fixed_text=greeting_text, kind="greeting")
     await outbound_q.put(("json", {"type": "bot_state", "state": "speaking"}))
 
     try:
@@ -223,6 +235,13 @@ async def _orchestrate(
                     speaking.barge_in_watchdog = asyncio.create_task(
                         _barge_in_watchdog(events_q, grace_remaining + _BARGE_IN_THRESHOLD_S)
                     )
+                elif speaking is None and pause_watchdog is not None:
+                    # Rider resumed talking before the pause-grace window elapsed - that was just
+                    # a mid-sentence pause, not the end of their turn. Cancel the pending flush;
+                    # whatever they said stays unflushed in STT's buffer and folds into the rest
+                    # of what they're now saying, same as the SPEAKING-state backchannel case.
+                    pause_watchdog.cancel()
+                    pause_watchdog = None
 
             elif etype == "vad_end":
                 if speaking is not None and speaking.barge_in_watchdog is not None:
@@ -232,7 +251,16 @@ async def _orchestrate(
                     # rider says next.
                     speaking.barge_in_watchdog.cancel()
                     speaking.barge_in_watchdog = None
-                elif speaking is None and not awaiting_transcript:
+                elif speaking is None and not awaiting_transcript and pause_watchdog is None:
+                    # Don't flush immediately - confirmed on a real call that Sarvam's VAD reports
+                    # vad_end on ANY pause, including a brief mid-sentence one, and flushing right
+                    # away cut the rider off mid-thought. Wait _PAUSE_GRACE_S first; only flush if
+                    # they haven't resumed by the time it fires (see "pause_confirmed" below).
+                    pause_watchdog = asyncio.create_task(_pause_watchdog(events_q, _PAUSE_GRACE_S))
+
+            elif etype == "pause_confirmed":
+                if speaking is None and not awaiting_transcript:
+                    pause_watchdog = None
                     awaiting_transcript = True
                     t_flush_sent = time.monotonic()
                     await stt_send_q.put({"kind": "flush"})
@@ -308,6 +336,8 @@ async def _orchestrate(
             elif etype == "stt_error":
                 logger.warning("Sarvam STT error: %s", event.get("raw"))
     finally:
+        if pause_watchdog is not None:
+            pause_watchdog.cancel()
         if speaking is not None and speaking.task is not None and not speaking.task.done():
             if speaking.barge_in_watchdog is not None:
                 speaking.barge_in_watchdog.cancel()
@@ -322,6 +352,11 @@ async def _orchestrate(
 async def _barge_in_watchdog(events_q: asyncio.Queue, delay: float) -> None:
     await asyncio.sleep(delay)
     await events_q.put({"type": "barge_in_confirmed"})
+
+
+async def _pause_watchdog(events_q: asyncio.Queue, delay: float) -> None:
+    await asyncio.sleep(delay)
+    await events_q.put({"type": "pause_confirmed"})
 
 
 async def _run_speaking(

@@ -23,8 +23,10 @@ sample-rate mismatch. Fixed below by passing sample_rate=16000 explicitly.
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -77,10 +79,20 @@ async def run_exotel_call(websocket: WebSocket) -> None:
         # 24kHz SarvamTTSStream defaults to. Leaving this at the default was the actual bug behind
         # "audio was garbled/unintelligible" on the first real call - it made the bot's replies play
         # back pitch-shifted and slowed by 24/16 = 1.5x.
-        async with (
-            SarvamSTTStream() as stt,
-            SarvamTTSStream(language=session.language_hint, sample_rate=16000) as tts,
-        ):
+        #
+        # STT and TTS connections are opened CONCURRENTLY (asyncio.gather), not via a plain
+        # `async with (a, b):` - that enters context managers sequentially, and each __aenter__ here
+        # is a real websockets.connect() round trip. Confirmed on a real call this was part of a
+        # ~4s gap of silence after the rider picked up, before the greeting could even start.
+        t0 = time.monotonic()
+        async with contextlib.AsyncExitStack() as stack:
+            stt, tts = await asyncio.gather(
+                stack.enter_async_context(SarvamSTTStream()),
+                stack.enter_async_context(
+                    SarvamTTSStream(language=session.language_hint, sample_rate=16000)
+                ),
+            )
+            logger.info("[latency] Sarvam STT+TTS connections opened: %.2fs", time.monotonic() - t0)
             await _orchestrate(
                 session,
                 stt,
