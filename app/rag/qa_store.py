@@ -110,14 +110,24 @@ def get_survey_questions() -> list[dict]:
 def retrieve(query: str, top_k: int = 3) -> list[dict]:
     """Searches ALL pairs (survey + faq) - a rider can ask about anything in the knowledge base,
     not just the "faq" rows, so this deliberately doesn't filter by type."""
+    return retrieve_multi([query], top_k=top_k)[0]
+
+
+def retrieve_multi(queries: list[str], top_k: int = 3) -> list[list[dict]]:
+    """Like retrieve(), but embeds and queries multiple texts in ONE batched call instead of one
+    per query. Confirmed on a real production call that each separate embedder.encode() call took
+    2-4s on Railway's CPU-only inference (no MPS/GPU there, unlike local dev) - call_session's
+    _retrieve_context() was making two such calls per turn, adding up to ~4-8s of pure embedding
+    latency to every single reply. Batching amortizes the model's per-call overhead across both
+    queries instead of paying it twice."""
     collection = _get_collection()
     count = collection.count()
     if count == 0:
-        return []
+        return [[] for _ in queries]
     embedder = _get_embedder()
-    query_embedding = embedder.encode([query], convert_to_numpy=True).tolist()
-    results = collection.query(query_embeddings=query_embedding, n_results=min(top_k, count))
+    query_embeddings = embedder.encode(queries, convert_to_numpy=True).tolist()
+    results = collection.query(query_embeddings=query_embeddings, n_results=min(top_k, count))
     return [
-        _row_from(doc, meta)
-        for doc, meta in zip(results["documents"][0], results["metadatas"][0])
+        [_row_from(doc, meta) for doc, meta in zip(docs, metas)]
+        for docs, metas in zip(results["documents"], results["metadatas"])
     ]

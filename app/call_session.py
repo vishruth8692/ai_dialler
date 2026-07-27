@@ -66,24 +66,29 @@ class CallSession:
         Filters to type=="faq" only - a survey row's "answer" field is an internal scripting note
         (e.g. "Confirm clarity on ratecard/earnings understanding"), not real informative content,
         so including it here just wastes a context slot (or worse, the survey question matching
-        itself crowds out the actual FAQ answer - also confirmed happening before this filter)."""
+        itself crowds out the actual FAQ answer - also confirmed happening before this filter).
+
+        Both queries are embedded in a single batched qa_store.retrieve_multi() call rather than
+        two separate retrieve() calls - confirmed on a real production call that each embed call
+        cost 2-4s on Railway's CPU-only inference, so two separate calls were adding 4-8s of pure
+        embedding latency to every reply."""
+        queries = [user_text]
+        if self.current_question:
+            queries.append(self.current_question["question"])
+        results_per_query = qa_store.retrieve_multi(queries, top_k=5)
+
         seen: set[str] = set()
         combined: list[dict] = []
-
-        def add(query: str, limit: int) -> None:
+        for results in results_per_query:
             added = 0
-            for item in qa_store.retrieve(query, top_k=5):
+            for item in results:
                 if item["type"] != "faq" or item["question"] in seen:
                     continue
                 seen.add(item["question"])
                 combined.append(item)
                 added += 1
-                if added >= limit:
-                    return
-
-        add(user_text, limit=2)
-        if self.current_question:
-            add(self.current_question["question"], limit=2)
+                if added >= 2:
+                    break
         return combined
 
     def pop_pending_user_turn(self) -> Optional[str]:

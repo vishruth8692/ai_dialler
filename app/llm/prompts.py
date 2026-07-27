@@ -22,6 +22,12 @@ Current scripted question:
 
 {remaining_note}
 
+If the partner's answer reveals they DON'T understand or aren't clear on something the current \
+question asked about (e.g. answering "no"/"not clear" to a comprehension question like the \
+rate card one), and the reference context below has relevant explanatory info, briefly explain it \
+- grounded ONLY in that context, never guessed - before moving on. Don't just acknowledge and defer \
+to "the team" when the context already has the answer.
+
 Relevant reference Q&A context you may use if the partner asks something. This is your ONLY source \
 of facts - never state a specific number, timeframe, or policy detail unless it is explicitly \
 written in this context below, even if it sounds plausible or like common knowledge. If the context \
@@ -37,52 +43,22 @@ For every partner utterance, decide exactly one of:
 current question so the call can continue.
 - They clearly want to end the call early (e.g. "I have to go", "call me later") -> call end_call.
 
-If record_answer is used and their answer reveals they DON'T understand or aren't clear on \
-something the current question asked about (e.g. answering "no"/"not clear" to a comprehension \
-question like the ratecard one), and the reference context below has relevant explanatory info, \
-briefly explain it - grounded ONLY in that context, never guessed - as part of reply_text before \
-moving on. Don't just acknowledge and defer to "the team" when the context already has the answer.
-
 If record_answer is used, follow the instruction above about whether more scripted questions \
-remain: either briefly acknowledge (and explain per the previous paragraph if relevant) and ask \
-the next one, or - only if it said this was the last scripted question - give a brief, warm \
-closing/thank-you line instead.
+remain: either briefly acknowledge and ask the next one, or - only if it said this was the last \
+scripted question - give a brief, warm closing/thank-you line instead.
 """
 
 SYSTEM_PROMPT_TEMPLATE = _SHARED_PROMPT_BODY + _TOOL_CALLING_INSTRUCTIONS
 
-CONTROL_DELIMITER = "\n###CONTROL###\n"
-
-_STREAMING_INSTRUCTIONS = """
-Respond in exactly two parts, in this order, with nothing else before, between, or after them:
-
-1. The spoken reply ONLY - just the words to say out loud. No labels, no markdown, no JSON here.
-2. The literal line ###CONTROL### on its own, then one line of compact JSON on the line after it:
-   {{"action": "record_answer", "answer_summary": "..."}} - if they answered the current question
-     (answer_summary: concise summary of their answer in their own words/language)
-   {{"action": "answer_from_context", "answer_summary": null}} - if they asked something else /
-     made a side comment (your spoken part in step 1 should already have answered from context,
-     using ONLY the reference context above, then re-asked the current question)
-   {{"action": "end_call", "answer_summary": null}} - if they clearly want to end the call early
-     (e.g. "I have to go", "call me later")
-
-If action is record_answer and their answer reveals they DON'T understand or aren't clear on \
-something the current question asked about (e.g. answering "no"/"not clear" to a comprehension \
-question like the ratecard one), and the reference context above has relevant explanatory info, \
-briefly explain it - grounded ONLY in that context, never guessed - as part of the spoken part \
-before moving on. Don't just acknowledge and defer to "the team" when the context already has the \
-answer.
-
-If action is record_answer, follow the instruction above about whether more scripted questions \
-remain: either briefly acknowledge (and explain per the previous paragraph if relevant) and ask \
-the next one, or - only if it said this was the last scripted question - make the spoken part a \
-brief, warm closing/thank-you line instead.
-
-ALWAYS include the ###CONTROL### line and the JSON line after it, even for a short reply - never \
-omit it, and never mention it or describe it in the spoken part.
+_STREAMING_REPLY_INSTRUCTIONS = """
+Respond with ONLY the natural spoken reply to say out loud right now - nothing else, no labels, \
+no markdown, no JSON, no meta-commentary about what this reply represents. Follow the instruction \
+above about whether more scripted questions remain: either briefly acknowledge and ask the next \
+one, or - only if it said this was the last scripted question - give a brief, warm closing/ \
+thank-you line instead.
 """
 
-SYSTEM_PROMPT_STREAMING_TEMPLATE = _SHARED_PROMPT_BODY + _STREAMING_INSTRUCTIONS
+SYSTEM_PROMPT_STREAMING_TEMPLATE = _SHARED_PROMPT_BODY + _STREAMING_REPLY_INSTRUCTIONS
 
 TOOLS = [
     {
@@ -145,4 +121,44 @@ TOOLS = [
             "required": ["reply_text"],
         },
     },
+]
+
+# Used only by ClaudeClient._classify_turn() - forced-tool classification of a turn whose spoken
+# reply has ALREADY been generated (by the streaming call) and spoken aloud. Kept separate from
+# TOOLS above because this call doesn't generate reply_text itself, only metadata about a reply
+# that already exists - see next_turn_stream()'s docstring for why this two-call split replaced
+# the original single-call delimiter approach (that approach let Claude silently omit the control
+# block on some turns, which defaulted to answer_from_context and meant recorded answers randomly
+# went missing - a real correctness bug, not just a latency one).
+CLASSIFY_TOOL = [
+    {
+        "name": "classify_turn",
+        "description": (
+            "Classify what the partner's last message represents, given the reply that a voice "
+            "assistant already generated and spoke to them in response."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["record_answer", "answer_from_context", "end_call"],
+                    "description": (
+                        "record_answer if they answered the current scripted question; "
+                        "answer_from_context if they asked something else or made a side comment; "
+                        "end_call if they clearly want to end the call early (e.g. \"I have to "
+                        "go\", \"call me later\")."
+                    ),
+                },
+                "answer_summary": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "If action is record_answer, a concise summary of their answer in their "
+                        "own words/language. Otherwise null."
+                    ),
+                },
+            },
+            "required": ["action", "answer_summary"],
+        },
+    }
 ]

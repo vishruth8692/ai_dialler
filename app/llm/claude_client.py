@@ -1,16 +1,18 @@
-import json
 import logging
 from typing import AsyncIterator, Optional
 
 import anthropic
 
 from app.config import ANTHROPIC_API_KEY, CLAUDE_MODEL
-from app.llm.prompts import CONTROL_DELIMITER, SYSTEM_PROMPT_STREAMING_TEMPLATE, SYSTEM_PROMPT_TEMPLATE, TOOLS
+from app.llm.prompts import (
+    CLASSIFY_TOOL,
+    SYSTEM_PROMPT_STREAMING_TEMPLATE,
+    SYSTEM_PROMPT_TEMPLATE,
+    TOOLS,
+)
 from app.llm.sentence_chunker import SentenceChunker
 
 logger = logging.getLogger(__name__)
-
-_VALID_ACTIONS = {"record_answer", "answer_from_context", "end_call"}
 
 # Module-level singletons so every call session reuses the same underlying HTTP connection pool
 # instead of paying a fresh TCP+TLS handshake on every new CallSession().
@@ -142,13 +144,20 @@ class ClaudeClient:
     ) -> AsyncIterator[dict]:
         """Streaming counterpart to next_turn(). Yields {"type": "speech_chunk", "text": ...} as
         sentences complete, followed by exactly one {"type": "final", "tool_name", "answer_summary",
-        "reply_text"} once the model finishes and the trailing control block has been parsed.
+        "reply_text"} once the model finishes speaking and a follow-up classification call (see
+        _classify_turn()) completes.
 
-        Claude isn't forced through tool-calling here (tool-use JSON doesn't stream cleanly into
-        sentence-chunked TTS) - instead it's instructed to emit plain speech, then a delimiter, then
-        a small JSON control block (see SYSTEM_PROMPT_STREAMING_TEMPLATE). If the delimiter is never
-        emitted or the JSON fails to parse, this falls back to answer_from_context/None, same
-        graceful-degradation philosophy as next_turn()'s no-tool-call fallback above.
+        Speech generation and action classification are deliberately two separate API calls.
+        The original design asked one streaming call to both speak AND reliably self-report a
+        trailing JSON control block (a delimiter + JSON blob) - confirmed on a real production
+        call that Claude sometimes genuinely omits the block entirely (not just a whitespace/
+        formatting mismatch), which silently defaulted to answer_from_context and meant the
+        survey quietly stopped recording answers - a correctness bug, not just a latency one.
+        _classify_turn() reuses the same forced tool_choice mechanism next_turn() already relies
+        on without this problem. Because it only runs after generation finishes, and
+        app/streaming/call_ws_handler.py holds the "speaking" state open for the estimated
+        real-time audio playback duration afterward, this call overlaps with that wait in the
+        common case rather than adding fully to perceived latency.
         """
         system = self._render_prompt(
             SYSTEM_PROMPT_STREAMING_TEMPLATE, current_question, retrieved_context, next_question
@@ -156,10 +165,6 @@ class ClaudeClient:
 
         chunker = SentenceChunker()
         speech_parts: list[str] = []
-        buf = ""
-        control_raw = ""
-        delimiter_found = False
-        hold_back = len(CONTROL_DELIMITER) - 1
 
         async with self._async_client.messages.stream(
             model=CLAUDE_MODEL,
@@ -168,51 +173,63 @@ class ClaudeClient:
             messages=history,
         ) as stream:
             async for delta in stream.text_stream:
-                if delimiter_found:
-                    control_raw += delta
-                    continue
+                for chunk in chunker.feed(delta):
+                    speech_parts.append(chunk)
+                    yield {"type": "speech_chunk", "text": chunk}
 
-                buf += delta
-                idx = buf.find(CONTROL_DELIMITER)
-                if idx != -1:
-                    for chunk in chunker.feed(buf[:idx], final=True):
-                        speech_parts.append(chunk)
-                        yield {"type": "speech_chunk", "text": chunk}
-                    control_raw = buf[idx + len(CONTROL_DELIMITER) :]
-                    buf = ""
-                    delimiter_found = True
-                else:
-                    # Hold back a tail long enough that a delimiter split across two deltas is
-                    # never missed - only release text once we're sure it's not part of one.
-                    safe_len = max(0, len(buf) - hold_back)
-                    if safe_len:
-                        for chunk in chunker.feed(buf[:safe_len]):
-                            speech_parts.append(chunk)
-                            yield {"type": "speech_chunk", "text": chunk}
-                        buf = buf[safe_len:]
+        for chunk in chunker.feed("", final=True):
+            speech_parts.append(chunk)
+            yield {"type": "speech_chunk", "text": chunk}
 
-        if not delimiter_found:
-            logger.warning("Claude stream ended without emitting %r - falling back", CONTROL_DELIMITER.strip())
-            for chunk in chunker.feed(buf, final=True):
-                speech_parts.append(chunk)
-                yield {"type": "speech_chunk", "text": chunk}
-            tool_name, answer_summary = "answer_from_context", None
-        else:
-            tool_name, answer_summary = "answer_from_context", None
-            try:
-                parsed = json.loads(control_raw.strip())
-                action = parsed.get("action")
-                if action in _VALID_ACTIONS:
-                    tool_name = action
-                    answer_summary = parsed.get("answer_summary")
-                else:
-                    logger.warning("Claude control block had invalid action %r - falling back", action)
-            except (json.JSONDecodeError, AttributeError):
-                logger.warning("Claude control block failed to parse: %r", control_raw)
+        reply_text = " ".join(speech_parts).strip()
+        classification = await self._classify_turn(history, current_question, reply_text)
 
         yield {
             "type": "final",
-            "tool_name": tool_name,
-            "answer_summary": answer_summary,
-            "reply_text": " ".join(speech_parts).strip(),
+            "tool_name": classification["tool_name"],
+            "answer_summary": classification["answer_summary"],
+            "reply_text": reply_text,
         }
+
+    async def _classify_turn(
+        self,
+        history: list[dict],
+        current_question: Optional[dict],
+        reply_text: str,
+    ) -> dict:
+        """Forced tool-call classification of a turn whose spoken reply has ALREADY been
+        generated and spoken - see next_turn_stream()'s docstring for why this replaced the
+        delimiter-based approach. Falls back to answer_from_context/None only if the API call
+        itself fails (network error etc.) - tool_choice being forced means Claude can't decline
+        to call it the way it could omit a trailing delimiter."""
+        current_q_text = f'"{current_question["question"]}"' if current_question else "None"
+        system = (
+            "A voice assistant on a phone call with a delivery partner just spoke the following "
+            f"reply, in response to the partner's last message:\n\n{reply_text}\n\n"
+            f"Current scripted question at the time: {current_q_text}\n\n"
+            "If the reply explains something the partner didn't understand ABOUT the current "
+            "scripted question itself (e.g. they said they don't understand the rate card, and "
+            "the reply now explains it), that is still record_answer - a \"no\"/\"not clear\" IS "
+            "a valid answer to a comprehension question, and the explanation is a courtesy "
+            "follow-up, not a new topic. Only use answer_from_context when the partner's message "
+            "was about something UNRELATED to the current scripted question.\n\n"
+            "Classify this turn using the classify_turn tool."
+        )
+        try:
+            response = await self._async_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=200,
+                system=system,
+                tools=CLASSIFY_TOOL,
+                tool_choice={"type": "tool", "name": "classify_turn"},
+                messages=history,
+            )
+            for block in response.content:
+                if block.type == "tool_use":
+                    return {
+                        "tool_name": block.input.get("action", "answer_from_context"),
+                        "answer_summary": block.input.get("answer_summary"),
+                    }
+        except Exception:
+            logger.exception("Turn classification call failed")
+        return {"tool_name": "answer_from_context", "answer_summary": None}
