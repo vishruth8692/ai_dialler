@@ -15,6 +15,26 @@ logger = logging.getLogger(__name__)
 
 _subscribers: set[WebSocket] = set()
 
+# Tracked alongside the existing "call_lifecycle" started/ended broadcasts (see
+# app/streaming/exotel_ws_adapter.py) - a queryable version of the same one-call-at-a-time fact
+# this module's docstring already relies on, so app/attrition/call_queue.py can wait for the
+# current call to actually finish before placing the next one in a bulk-call CSV run.
+_call_active = False
+
+
+def mark_call_started() -> None:
+    global _call_active
+    _call_active = True
+
+
+def mark_call_ended() -> None:
+    global _call_active
+    _call_active = False
+
+
+def is_call_active() -> bool:
+    return _call_active
+
 
 async def register(websocket: WebSocket) -> None:
     await websocket.accept()

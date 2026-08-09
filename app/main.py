@@ -1,6 +1,7 @@
-import base64
+import csv
+import io
+import json
 import logging
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -11,24 +12,19 @@ from urllib.parse import quote
 # debugging time earlier in this project. Set explicitly so `logger.info(...)` calls are visible.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-from fastapi import (
-    Cookie,
-    FastAPI,
-    File,
-    Form,
-    Request,
-    Response,
-    UploadFile,
-    WebSocket,
-    WebSocketDisconnect,
-)
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from app.call_session import CallSession
+from app.attrition import call_queue as attrition_call_queue
+from app.attrition import prompts as attrition_prompts
+from app.attrition import qa_store as attrition_qa_store
+from app.attrition import stage_store as attrition_stage_store
+from app.attrition.call_session import AttritionCallSession, is_attrition_configured, missing_attrition_settings
 from app.config import (
+    ATTRITION_SAFETY_HELPLINE,
     EXOTEL_API_KEY,
     EXOTEL_API_TOKEN,
     EXOTEL_CALLER_ID,
@@ -36,10 +32,9 @@ from app.config import (
     PUBLIC_BASE_URL,
     QA_UPLOADS_DIR,
 )
+from app.llm import attrition_classifier
 from app.rag import qa_store
 from app.rag.ingest import ingest_csv
-from app.speech import stt_sarvam, tts_sarvam
-from app.streaming.call_ws_handler import run_call
 from app.streaming.exotel_ws_adapter import run_exotel_call
 from app.telephony import call_history, call_monitor, exotel_client
 
@@ -61,11 +56,6 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-# In-memory store of mock-call sessions, keyed by a per-browser cookie. Fine for local testing;
-# real calls in Phase 4 will be keyed by the Exotel call SID instead.
-_chat_sessions: dict[str, CallSession] = {}
-
 
 @app.get("/health")
 async def health():
@@ -113,172 +103,6 @@ async def qa_upload(file: UploadFile = File(...)):
     return RedirectResponse(url=f"/qa?message={quote(message)}", status_code=303)
 
 
-class ChatMessage(BaseModel):
-    text: str
-
-
-@app.get("/chat")
-async def chat_page(request: Request):
-    return templates.TemplateResponse(request, "chat.html", {})
-
-
-@app.post("/chat/start")
-async def chat_start(response: Response):
-    if not qa_store.get_survey_questions():
-        return JSONResponse(
-            {"error": "No survey questions loaded yet — upload a CSV at /qa first."}, status_code=400
-        )
-
-    session_id = str(uuid.uuid4())
-    session = CallSession()
-
-    try:
-        greeting = session.greeting()
-    except Exception as e:
-        return JSONResponse({"error": f"Claude call failed: {e}"}, status_code=502)
-
-    _chat_sessions[session_id] = session
-    response.set_cookie("session_id", session_id, httponly=True, samesite="lax")
-    return {"reply": greeting, "ended": session.ended}
-
-
-@app.post("/chat/send")
-async def chat_send(payload: ChatMessage, session_id: Optional[str] = Cookie(None)):
-    session = _chat_sessions.get(session_id) if session_id else None
-    if session is None:
-        return JSONResponse({"error": "No active call — click 'Start new call' first."}, status_code=400)
-
-    try:
-        turn = session.handle_user_turn(payload.text)
-    except Exception as e:
-        return JSONResponse({"error": f"Claude call failed: {e}"}, status_code=502)
-
-    return {
-        "reply": turn["reply_text"],
-        "tool_name": turn["tool_name"],
-        "answer_summary": turn["answer_summary"],
-        "retrieved_context": turn["retrieved_context"],
-        "ended": session.ended,
-        "collected_answers": session.collected_answers,
-    }
-
-
-@app.get("/voice")
-async def voice_page(request: Request):
-    return templates.TemplateResponse(request, "voice_chat.html", {})
-
-
-@app.post("/voice/start")
-async def voice_start(response: Response):
-    if not qa_store.get_survey_questions():
-        return JSONResponse(
-            {"error": "No survey questions loaded yet — upload a CSV at /qa first."}, status_code=400
-        )
-
-    session_id = str(uuid.uuid4())
-    session = CallSession()
-
-    try:
-        greeting_text = session.greeting()
-        audio_bytes = tts_sarvam.synthesize(greeting_text, language=session.language_hint)
-    except Exception as e:
-        return JSONResponse({"error": f"Could not start call: {e}"}, status_code=502)
-
-    _chat_sessions[session_id] = session
-    response.set_cookie("session_id", session_id, httponly=True, samesite="lax")
-    return {
-        "reply_text": greeting_text,
-        "audio_base64": base64.b64encode(audio_bytes).decode(),
-        "ended": session.ended,
-    }
-
-
-@app.post("/voice/transcribe")
-async def voice_transcribe(audio: UploadFile = File(...), session_id: Optional[str] = Cookie(None)):
-    """Step 1 of 2: transcribe only, so the UI can show what the rider said right away instead of
-    waiting for the LLM + TTS round-trip too."""
-    session = _chat_sessions.get(session_id) if session_id else None
-    if session is None:
-        return JSONResponse(
-            {"error": "No active call — click 'Start new call' first."}, status_code=400
-        )
-
-    content = await audio.read()
-    content_type = audio.content_type or "audio/webm"
-    filename = audio.filename or "recording.webm"
-
-    try:
-        stt_result = stt_sarvam.transcribe_bytes(content, filename=filename, content_type=content_type)
-    except Exception as e:
-        return JSONResponse({"error": f"Transcription failed: {e}"}, status_code=502)
-
-    return {
-        "transcript": stt_result["transcript"].strip(),
-        "language_code": stt_result["language_code"] or session.language_hint,
-    }
-
-
-class VoiceReplyRequest(BaseModel):
-    text: str
-    language_code: str = "english"
-
-
-@app.post("/voice/reply")
-async def voice_reply(payload: VoiceReplyRequest, session_id: Optional[str] = Cookie(None)):
-    """Step 2 of 2: run the transcript through Claude + TTS."""
-    session = _chat_sessions.get(session_id) if session_id else None
-    if session is None:
-        return JSONResponse(
-            {"error": "No active call — click 'Start new call' first."}, status_code=400
-        )
-
-    transcript = payload.text.strip()
-    language = payload.language_code or session.language_hint
-
-    if not transcript:
-        reply_text = "Sorry, I didn't catch that — could you say it again?"
-        try:
-            audio_bytes = tts_sarvam.synthesize(reply_text, language=language)
-        except Exception as e:
-            return JSONResponse({"error": f"Speech synthesis failed: {e}"}, status_code=502)
-        return {
-            "reply_text": reply_text,
-            "tool_name": None,
-            "answer_summary": None,
-            "retrieved_context": [],
-            "audio_base64": base64.b64encode(audio_bytes).decode(),
-            "ended": session.ended,
-            "collected_answers": session.collected_answers,
-        }
-
-    try:
-        turn = session.handle_user_turn(transcript)
-        reply_text = turn["reply_text"]
-        audio_bytes = tts_sarvam.synthesize(reply_text, language=language)
-    except Exception as e:
-        return JSONResponse({"error": f"Voice call failed: {e}"}, status_code=502)
-
-    return {
-        "reply_text": reply_text,
-        "tool_name": turn["tool_name"],
-        "answer_summary": turn["answer_summary"],
-        "retrieved_context": turn["retrieved_context"],
-        "audio_base64": base64.b64encode(audio_bytes).decode(),
-        "ended": session.ended,
-        "collected_answers": session.collected_answers,
-    }
-
-
-@app.get("/voice/live")
-async def voice_live_page(request: Request):
-    return templates.TemplateResponse(request, "voice_chat_live.html", {})
-
-
-@app.websocket("/voice/ws")
-async def voice_ws(websocket: WebSocket):
-    await run_call(websocket)
-
-
 def _exotel_settings_status() -> list[tuple[str, bool]]:
     return [
         ("EXOTEL_SID", bool(EXOTEL_SID)),
@@ -289,57 +113,417 @@ def _exotel_settings_status() -> list[tuple[str, bool]]:
     ]
 
 
-@app.get("/telephony")
-async def telephony_page(request: Request, message: Optional[str] = None, error: Optional[str] = None):
-    settings_status = _exotel_settings_status()
+def _attrition_settings_status() -> list[tuple[str, bool]]:
+    # Same underlying Exotel requirement as /telephony, plus ATTRITION_SAFETY_HELPLINE - the one
+    # remaining attrition-specific value, needed for the safety hard-stop (see
+    # app/attrition/call_session.py's missing_attrition_settings() docstring for why it's a hard
+    # block, unlike the Zepto bot's soft warning). Ordinary side-questions need no config - they're
+    # handled by pointing riders to the Zepto app's own support-ticket flow.
+    return _exotel_settings_status() + [("ATTRITION_SAFETY_HELPLINE", bool(ATTRITION_SAFETY_HELPLINE))]
+
+
+def _attrition_stage_flow() -> dict:
+    """The call's flow chart, as rendered on /attrition: each stage's editable instruction text
+    plus the (fixed, non-editable) arrow labels that show which classified signal moves the call
+    to the next stage - that graph itself lives in app/attrition/call_session.py's
+    _STAGE_TRANSITIONS and isn't user-editable, only restated here for display."""
+    effective = attrition_prompts.effective_stage_text()
+    defaults = attrition_prompts.default_stage_text()
+
+    def node(key, label, arrow_in, arrow_out, side_note=None, placeholder_hint=None):
+        return {
+            "key": key,
+            "label": label,
+            "arrow_in": arrow_in,
+            "arrow_out": arrow_out,
+            "side_note": side_note,
+            "placeholder_hint": placeholder_hint,
+            "text": effective[key],
+            "is_default": effective[key] == defaults[key],
+        }
+
+    main = [
+        node(
+            attrition_prompts.GREETING,
+            "1 · Greeting & identity check",
+            None,
+            "ready_to_continue",
+            placeholder_hint='Uses {identity_line} as a placeholder, filled in automatically with '
+            "the rider's name (or a generic phrase if none was given on the dial-in form). Don't "
+            "remove it unless you want to skip the identity check.",
+        ),
+        node(
+            attrition_prompts.STATUS_GATE,
+            "2 · Status gate",
+            "ready_to_continue",
+            "stopped / never_started",
+            side_note="If the rider is still working or on a temporary break, the call closes "
+            "warmly right here - stages 3-6 below never run.",
+        ),
+        node(
+            attrition_prompts.OPEN_QUESTION,
+            "3 · Open question — why did you stop",
+            "stopped / never_started",
+            "reason_given",
+        ),
+        node(attrition_prompts.PROBE, "4 · Probe — get specific", "reason_given", "probe_answered / vague_reason"),
+        node(
+            attrition_prompts.LAST_STRAW,
+            "5 · Last straw",
+            "probe_answered / vague_reason",
+            "last_straw_given",
+        ),
+        node(attrition_prompts.GRIEVANCE, "6 · Grievance & close", "last_straw_given", "call ends"),
+    ]
+    safety = node(
+        attrition_prompts.SAFETY_STOP,
+        "⚠ Safety stop — interrupts any stage above",
+        "injury / accident / assault / threat / distress, from any stage",
+        "call ends",
+        placeholder_hint="Uses {safety_helpline} as a placeholder, filled in automatically from the "
+        "ATTRITION_SAFETY_HELPLINE setting. The code guarantees this number is spoken even if this "
+        "text omits it, so don't rely on removing it to suppress the number.",
+    )
+    return {"main": main, "safety": safety}
+
+
+def _attrition_calls() -> list[dict]:
+    return [c for c in call_history.list_calls() if c.get("call_type") == "attrition"]
+
+
+@app.get("/attrition")
+async def attrition_page(request: Request, message: Optional[str] = None, error: Optional[str] = None):
+    settings_status = _attrition_settings_status()
     return templates.TemplateResponse(
         request,
-        "telephony.html",
+        "attrition.html",
         {
             "settings_status": settings_status,
             "configured": all(is_set for _, is_set in settings_status),
             "message": message,
             "error": error,
-            "history": call_history.list_calls(),
+            "history": _attrition_calls(),
+            "stage_flow": _attrition_stage_flow(),
+            "qa_pairs": attrition_qa_store.list_pairs(),
+            "queue_status": attrition_call_queue.status(),
         },
     )
 
 
-@app.post("/telephony/call")
-async def telephony_place_call(to_number: str = Form(...)):
+_CSV_COLUMNS = [
+    "call_sid", "phone_number", "rider_name", "rider_code", "city", "store_name",
+    "started_at", "ended_at",
+    "status_gate", "primary_reason_l1", "primary_reason_l2", "reason_confidence",
+    "last_straw", "other_reason_text",
+    "severity", "welfare_flag", "fraud_report", "do_not_call", "wants_to_return",
+    "grievance_raised_with", "grievance_resolution_experience", "grievance_ticket_reference",
+    "money_claim_type", "money_claim_amount_inr", "money_claim_period", "money_claim_order_code",
+    "store_context_store_name", "store_context_city", "store_context_person_role_complained_about",
+    "alt_work_platform_named", "alt_work_claimed_delta",
+    "internal_route", "internal_note", "info_gaps", "unanswered_question",
+    "transcript",
+]
+
+
+def _flatten_attrition_call(call: dict) -> dict:
+    """One spreadsheet row per call - flattens the nested §8 structured_record (see
+    app/llm/attrition_classifier.py) into the CSV columns above. Missing/not-yet-classified
+    records (call.structured_record is None) just leave those columns blank rather than error."""
+    rec = call.get("structured_record") or {}
+    dial = call.get("dial_record") or {}
+    grievance = rec.get("grievance") or {}
+    money_claim = rec.get("money_claim") or {}
+    store_context = rec.get("store_context") or {}
+    alt_work = rec.get("alt_work") or {}
+    transcript = " | ".join(f'{t.get("role")}: {t.get("text")}' for t in call.get("transcript") or [])
+    return {
+        "call_sid": call.get("call_sid"),
+        "phone_number": call.get("phone_number"),
+        "rider_name": dial.get("rider_name"),
+        "rider_code": dial.get("rider_code"),
+        "city": dial.get("city"),
+        "store_name": dial.get("store_name"),
+        "started_at": call.get("started_at"),
+        "ended_at": call.get("ended_at"),
+        "status_gate": rec.get("status_gate"),
+        "primary_reason_l1": rec.get("primary_reason_l1"),
+        "primary_reason_l2": rec.get("primary_reason_l2"),
+        "reason_confidence": rec.get("reason_confidence"),
+        "last_straw": rec.get("last_straw"),
+        "other_reason_text": rec.get("other_reason_text"),
+        "severity": rec.get("severity"),
+        "welfare_flag": rec.get("welfare_flag"),
+        "fraud_report": rec.get("fraud_report"),
+        "do_not_call": rec.get("do_not_call"),
+        "wants_to_return": rec.get("wants_to_return"),
+        "grievance_raised_with": grievance.get("raised_with"),
+        "grievance_resolution_experience": grievance.get("resolution_experience"),
+        "grievance_ticket_reference": grievance.get("ticket_reference"),
+        "money_claim_type": money_claim.get("type"),
+        "money_claim_amount_inr": money_claim.get("amount_inr"),
+        "money_claim_period": money_claim.get("period"),
+        "money_claim_order_code": money_claim.get("order_code"),
+        "store_context_store_name": store_context.get("store_name"),
+        "store_context_city": store_context.get("city"),
+        "store_context_person_role_complained_about": store_context.get("person_role_complained_about"),
+        "alt_work_platform_named": alt_work.get("platform_named"),
+        "alt_work_claimed_delta": alt_work.get("claimed_delta"),
+        "internal_route": rec.get("internal_route"),
+        "internal_note": rec.get("internal_note"),
+        "info_gaps": ";".join(rec.get("info_gaps") or []),
+        "unanswered_question": rec.get("unanswered_question"),
+        "transcript": transcript,
+    }
+
+
+@app.get("/attrition/calls/export.csv")
+async def attrition_export_csv():
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=_CSV_COLUMNS)
+    writer.writeheader()
+    for call in _attrition_calls():
+        writer.writerow(_flatten_attrition_call(call))
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="attrition-calls-{stamp}.csv"'},
+    )
+
+
+@app.get("/attrition/calls/export.json")
+async def attrition_export_json():
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=json.dumps(_attrition_calls(), ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="attrition-calls-{stamp}.json"'},
+    )
+
+
+class AttritionStagesPayload(BaseModel):
+    stages: dict[str, str]
+
+
+class AttritionResetPayload(BaseModel):
+    stage: Optional[str] = None
+
+
+@app.get("/attrition/stages")
+async def attrition_get_stages():
+    """JSON view of the current flow - used by the /attrition page's JS after a reset, so it can
+    refresh without a full page reload."""
+    return JSONResponse(
+        {
+            "stages": attrition_prompts.effective_stage_text(),
+            "defaults": attrition_prompts.default_stage_text(),
+        }
+    )
+
+
+@app.post("/attrition/stages")
+async def attrition_save_stages(payload: AttritionStagesPayload):
+    """Saves edited stage wording. Every call re-renders its system prompt fresh each turn (see
+    AttritionCallSession._system_prompt()), so a save here takes effect on the very next call turn
+    placed after it - no restart needed."""
+    stripped = {stage: text.strip() for stage, text in payload.stages.items()}
+    errors = {}
+    for stage, text in stripped.items():
+        err = attrition_prompts.validate_stage_text(stage, text)
+        if err:
+            errors[stage] = err
+    if errors:
+        return JSONResponse({"ok": False, "errors": errors}, status_code=400)
+
+    defaults = attrition_prompts.default_stage_text()
+    overrides = attrition_stage_store.load_overrides()
+    for stage, text in stripped.items():
+        # Only persist an override when the text actually differs from the default - an
+        # unmodified "Save changes" click, or typing the default text back in, should behave as a
+        # true no-op rather than silently marking every stage "customized".
+        if stage in defaults and text == defaults[stage]:
+            overrides.pop(stage, None)
+        else:
+            overrides[stage] = text
+    attrition_stage_store.save_overrides(overrides)
+    return JSONResponse({"ok": True, "defaults": defaults})
+
+
+@app.post("/attrition/stages/reset")
+async def attrition_reset_stages(payload: AttritionResetPayload):
+    overrides = attrition_stage_store.load_overrides()
+    if payload.stage:
+        overrides.pop(payload.stage, None)
+    else:
+        overrides = {}
+    attrition_stage_store.save_overrides(overrides)
+    return JSONResponse(
+        {
+            "ok": True,
+            "stages": attrition_prompts.effective_stage_text(),
+            "defaults": attrition_prompts.default_stage_text(),
+        }
+    )
+
+
+class AttritionQaPayload(BaseModel):
+    question: str
+    answer: str
+
+
+class AttritionQaDeletePayload(BaseModel):
+    index: int
+
+
+@app.get("/attrition/qa")
+async def attrition_get_qa():
+    return JSONResponse({"pairs": attrition_qa_store.list_pairs()})
+
+
+@app.post("/attrition/qa")
+async def attrition_add_qa(payload: AttritionQaPayload):
+    question = payload.question.strip()
+    answer = payload.answer.strip()
+    if not question or not answer:
+        return JSONResponse({"ok": False, "error": "Both question and answer are required."}, status_code=400)
+    attrition_qa_store.add_pair(question, answer)
+    return JSONResponse({"ok": True, "pairs": attrition_qa_store.list_pairs()})
+
+
+@app.post("/attrition/qa/delete")
+async def attrition_delete_qa(payload: AttritionQaDeletePayload):
+    attrition_qa_store.delete_pair(payload.index)
+    return JSONResponse({"ok": True, "pairs": attrition_qa_store.list_pairs()})
+
+
+@app.post("/attrition/qa/upload")
+async def attrition_upload_qa(file: UploadFile = File(...)):
+    """Bulk-adds from a CSV (question, answer columns) - appends to whatever's already saved
+    rather than replacing it, so this can be used alongside one-at-a-time adds."""
+    content = await file.read()
     try:
-        result = exotel_client.place_call(to_number)
+        pairs = attrition_qa_store.parse_csv(content)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    except Exception:
+        return JSONResponse(
+            {"ok": False, "error": "Could not process that file - is it a valid CSV?"}, status_code=400
+        )
+    attrition_qa_store.add_pairs(pairs)
+    return JSONResponse({"ok": True, "added": len(pairs), "pairs": attrition_qa_store.list_pairs()})
+
+
+@app.post("/attrition/call")
+async def attrition_place_call(
+    to_number: str = Form(...),
+    rider_name: str = Form(""),
+    rider_code: str = Form(""),
+    city: str = Form(""),
+    store_name: str = Form(""),
+    preferred_language: str = Form(""),
+):
+    if not is_attrition_configured():
+        return RedirectResponse(
+            url=f"/attrition?error={quote('Missing settings: ' + ', '.join(missing_attrition_settings()))}",
+            status_code=303,
+        )
+    if attrition_call_queue.status()["running"]:
+        # This app can only run one live call at a time (see call_monitor.py's docstring) - a
+        # manual call placed while the bulk queue is also trying to place one would race it.
+        return RedirectResponse(
+            url=f"/attrition?error={quote('A bulk call queue is currently running - wait for it to finish or clear it first.')}",
+            status_code=303,
+        )
+
+    dial_record = {
+        k: v
+        for k, v in {
+            "rider_name": rider_name,
+            "rider_code": rider_code,
+            "city": city,
+            "store_name": store_name,
+            "preferred_language": preferred_language,
+        }.items()
+        if v
+    }
+    try:
+        result = exotel_client.place_call(to_number, dial_record=dial_record, stream_path="/attrition/exotel-stream")
     except exotel_client.ExotelNotConfigured as e:
-        return RedirectResponse(url=f"/telephony?error={quote(str(e))}", status_code=303)
+        return RedirectResponse(url=f"/attrition?error={quote(str(e))}", status_code=303)
     except Exception as e:
         return RedirectResponse(
-            url=f"/telephony?error={quote(f'Call failed: {e}')}", status_code=303
+            url=f"/attrition?error={quote(f'Call failed: {e}')}", status_code=303
         )
 
     call_sid = result.get("Call", {}).get("Sid", "unknown")
     return RedirectResponse(
-        url=f"/telephony?message={quote(f'Call placed to {to_number} (SID: {call_sid})')}",
+        url=f"/attrition?message={quote(f'Call placed to {to_number} (SID: {call_sid})')}",
         status_code=303,
     )
 
 
-@app.websocket("/telephony/exotel-stream")
-async def telephony_exotel_stream(websocket: WebSocket):
-    await run_exotel_call(websocket)
+@app.post("/attrition/calls/upload")
+async def attrition_upload_calls(file: UploadFile = File(...)):
+    """Bulk-calling: parses a CSV of phone numbers (+ optional dial-record columns) and enqueues
+    the valid rows - see app/attrition/call_queue.py for how they actually get placed (one at a
+    time, 30s gap after each finishes, never overlapping a live call)."""
+    if not is_attrition_configured():
+        return JSONResponse(
+            {"ok": False, "error": "Missing settings: " + ", ".join(missing_attrition_settings())},
+            status_code=400,
+        )
+    content = await file.read()
+    try:
+        rows, errors = attrition_call_queue.parse_csv(content)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    except Exception:
+        return JSONResponse(
+            {"ok": False, "error": "Could not process that file - is it a valid CSV?"}, status_code=400
+        )
+    attrition_call_queue.enqueue(rows)
+    return JSONResponse({"ok": True, "enqueued": len(rows), "errors": errors, "status": attrition_call_queue.status()})
 
 
-@app.websocket("/telephony/monitor-ws")
-async def telephony_monitor_ws(websocket: WebSocket):
-    """Browser-facing feed for /telephony's live call view - broadcasts the same transcript/reply/
-    debug events a real Exotel call produces, sourced from app/telephony/call_monitor.py. Carries
-    no audio (the call's audio goes to the phone, not here)."""
+@app.get("/attrition/calls/queue-status")
+async def attrition_queue_status():
+    return JSONResponse(attrition_call_queue.status())
+
+
+@app.post("/attrition/calls/queue/clear")
+async def attrition_queue_clear():
+    attrition_call_queue.clear_pending()
+    return JSONResponse(attrition_call_queue.status())
+
+
+@app.post("/attrition/calls/queue/reset")
+async def attrition_queue_reset():
+    attrition_call_queue.reset()
+    return JSONResponse(attrition_call_queue.status())
+
+
+@app.websocket("/attrition/exotel-stream")
+async def attrition_exotel_stream(websocket: WebSocket):
+    await run_exotel_call(
+        websocket,
+        call_type="attrition",
+        session_factory=lambda dial_record: AttritionCallSession(dial_record=dial_record),
+        configured_check=is_attrition_configured,
+        not_configured_message=(
+            "Exotel attrition call connected but required settings are missing "
+            f"({', '.join(missing_attrition_settings())}) - closing."
+        ),
+        classify_fn=attrition_classifier.classify_call,
+    )
+
+
+@app.websocket("/attrition/monitor-ws")
+async def attrition_monitor_ws(websocket: WebSocket):
+    """Same shared call_monitor feed /telephony/monitor-ws uses - see call_monitor.py's docstring:
+    one outbound call at a time app-wide, so there's never ambiguity about which call is live."""
     await call_monitor.register(websocket)
     try:
         while True:
-            # Bare .receive() returns a {"type":"websocket.disconnect"} message on disconnect -
-            # it does NOT raise WebSocketDisconnect the way .receive_text()/.receive_json() do.
-            # Calling .receive() again after that message raises RuntimeError (confirmed on a
-            # real call when a monitor tab was closed) - check the message type explicitly.
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
                 break

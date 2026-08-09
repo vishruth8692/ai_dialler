@@ -5,3 +5,5 @@ __pycache__/
 data/chroma/
 data/qa_uploads/
 data/call_history.json
+data/attrition_stage_overrides.json
+data/attrition_qa.json

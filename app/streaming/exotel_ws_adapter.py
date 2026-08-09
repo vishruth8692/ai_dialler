@@ -29,7 +29,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -51,26 +51,56 @@ class _ExotelCallInfo:
     call_sid: Optional[str] = None
     phone_number: Optional[str] = None
     started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    dial_record: dict = field(default_factory=dict)
     transcript: list = field(default_factory=list)
     collected_answers: list = field(default_factory=list)
     _pending_bot_text: list = field(default_factory=list)
 
 
-async def run_exotel_call(websocket: WebSocket) -> None:
+def _default_configured_check() -> bool:
+    return bool(qa_store.get_survey_questions())
+
+
+def _default_classify_fn(dial_record: dict, collected_answers: list, transcript: list) -> dict:
+    return call_tagger.classify_call(collected_answers, transcript)
+
+
+async def run_exotel_call(
+    websocket: WebSocket,
+    *,
+    call_type: str = "zepto_feedback",
+    session_factory: Callable[[dict], object] = lambda dial_record: CallSession(),
+    configured_check: Callable[[], bool] = _default_configured_check,
+    not_configured_message: str = "Exotel call connected but no survey questions are loaded - closing.",
+    classify_fn: Callable[[dict, list, list], dict] = _default_classify_fn,
+) -> None:
     """Entry point for Exotel's WebSocket connection - one call per connection, same shape as
     call_ws_handler.run_call() for the browser path. No error messages are sent back on failure
     (unlike the browser path) since there's no UI on the other end to show them to - just log and
-    close so the call ends cleanly."""
+    close so the call ends cleanly.
+
+    Shared by both call types (Zepto feedback and rider attrition) - only `session_factory` (which
+    session class to drive), `configured_check` (what "ready for a real call" means for that bot),
+    and `classify_fn` (how to turn a finished call into a stored record) differ; the ~150 lines of
+    Exotel media-handling/history-capture logic below is identical either way.
+    """
     await websocket.accept()
 
-    if not qa_store.get_survey_questions():
-        logger.error("Exotel call connected but no survey questions are loaded - closing.")
+    if not configured_check():
+        logger.error(not_configured_message)
         await websocket.close()
         return
 
-    call_info = _ExotelCallInfo()
-    session = CallSession()
+    # The rider dial record (rider_name, rider_code, city, ...) travels through the same
+    # query-string passthrough already proven for ?sample-rate=16000 - Exotel echoes back whatever
+    # was in the StreamUrl we gave it when placing the call (see app/telephony/exotel_client.py).
+    # Empty {} for the Zepto bot, which doesn't need one.
+    dial_record = {k: v for k, v in websocket.query_params.items() if k != "sample-rate"}
 
+    call_info = _ExotelCallInfo(dial_record=dial_record)
+    session = session_factory(dial_record)
+
+    call_monitor.mark_call_started()
     await call_monitor.broadcast({"type": "call_lifecycle", "status": "started"})
     try:
         # sample_rate=16000 must match the rate negotiated with Exotel via the ?sample-rate=16000
@@ -109,27 +139,35 @@ async def run_exotel_call(websocket: WebSocket) -> None:
     except Exception:
         logger.exception("Exotel call failed")
     finally:
+        call_monitor.mark_call_ended()
         await call_monitor.broadcast({"type": "call_lifecycle", "status": "ended"})
         if call_info.transcript:
             # Only log a history entry if the call actually got underway (greeting spoken) - a
             # connection that never sent a real "start" event has nothing worth recording.
-            # Tagging is a nice-to-have annotation, run off the event loop since it's a blocking
-            # API call - never let a tagging failure stop the call record from being saved.
+            # Classification is a nice-to-have annotation, run off the event loop since it's a
+            # blocking API call - never let a classification failure stop the call record from
+            # being saved.
             classification = await asyncio.to_thread(
-                call_tagger.classify_call, call_info.collected_answers, call_info.transcript
+                classify_fn, call_info.dial_record, call_info.collected_answers, call_info.transcript
             )
-            call_history.add_call(
-                {
-                    "call_sid": call_info.call_sid,
-                    "phone_number": call_info.phone_number,
-                    "started_at": call_info.started_at,
-                    "ended_at": datetime.now(timezone.utc).isoformat(),
-                    "transcript": call_info.transcript,
-                    "collected_answers": call_info.collected_answers,
-                    "tags": classification["tags"],
-                    "summary": classification["summary"],
-                }
-            )
+            record = {
+                "call_type": call_type,
+                "call_sid": call_info.call_sid,
+                "phone_number": call_info.phone_number,
+                "dial_record": call_info.dial_record,
+                "started_at": call_info.started_at,
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+                "transcript": call_info.transcript,
+                "collected_answers": call_info.collected_answers,
+            }
+            if call_type == "zepto_feedback":
+                # Kept as top-level tags/summary fields, unchanged, so existing stored records and
+                # telephony.html's history rendering stay compatible.
+                record["tags"] = classification["tags"]
+                record["summary"] = classification["summary"]
+            else:
+                record["structured_record"] = classification
+            call_history.add_call(record)
         try:
             await websocket.close()
         except Exception:

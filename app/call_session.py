@@ -200,7 +200,7 @@ class CallSession:
             retrieved_context=retrieved,
             next_question=self.next_question,
         ):
-            if event["type"] == "speech_chunk":
+            if event["type"] in ("speech_chunk", "speech_done"):
                 yield event
             else:
                 tool_name = event["tool_name"]

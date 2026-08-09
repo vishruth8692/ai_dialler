@@ -199,7 +199,14 @@ async def _orchestrate(
         await tts.drain_pending(remaining)
 
     t_greeting_start = time.monotonic()
-    greeting_text = session.greeting()
+    # session.greeting() is a synchronous, blocking network call (both CallSession and
+    # AttritionCallSession use the sync Anthropic client for it) - calling it directly here would
+    # stall the ENTIRE event loop for its full duration (confirmed on real calls: 3-4.7s). That
+    # starved the Exotel WS reader task too, so Exotel's 'start' event only ever got processed
+    # AFTER greeting generation finished, not while the phone was still ringing/connecting where
+    # it could have overlapped for free. asyncio.to_thread() keeps the loop free to actually do
+    # that overlapping.
+    greeting_text = await asyncio.to_thread(session.greeting)
     logger.info("[latency] greeting generation (Claude call): %.2fs", time.monotonic() - t_greeting_start)
     speaking = start_speaking(fixed_text=greeting_text, kind="greeting")
     await outbound_q.put(("json", {"type": "bot_state", "state": "speaking"}))
@@ -375,17 +382,28 @@ async def _run_speaking(
     pushes {"type":"speaking_done","data":{...}} to events_q - pushes nothing if cancelled, since
     the canceller already knows what happened and drives whatever comes next itself."""
     llm_done = asyncio.Event()
+    # Set as soon as every speech_chunk for this turn has been flushed to TTS - strictly earlier
+    # than llm_done, which also waits on the post-reply classification API call (see
+    # app/llm/claude_client.py's next_turn_stream() docstring). forward() below waits on THIS, not
+    # llm_done, to decide it can stop listening for more TTS 'final' events - using llm_done there
+    # was a real bug: confirmed via logs on two live attrition calls, if every expected 'final' had
+    # already arrived before classification finished, forward() had no future event left to
+    # re-check its exit condition on, and hung until the 20s safety-net timeout forced recovery.
+    speech_flushed = asyncio.Event()
     final_data = {"tool_name": None, "answer_summary": None, "reply_text": "", "retrieved_context": []}
     total_audio_bytes = 0
 
     async def _send_and_flush(text: str) -> None:
         # Timed individually so a future hang (see _SPEAKING_TIMEOUT_S) shows up in logs as a slow
-        # send_text vs. a slow flush, rather than just "the reply never finished."
+        # send_text vs. a slow flush, rather than just "the reply never finished." INFO, not DEBUG
+        # - a real call already hit a 20s stuck-speaking recovery with nothing in the logs showing
+        # which flush the matching 'final' never came back for, because this line was DEBUG-level
+        # while the app runs at INFO (same class of gap main.py's own logging comment describes).
         t0 = time.monotonic()
         await tts.send_text(_normalize_for_tts(text))
         await tts.flush()
         handle.flushes_sent += 1
-        logger.debug("send_text+flush #%d took %.2fs", handle.flushes_sent, time.monotonic() - t0)
+        logger.info("send_text+flush #%d took %.2fs", handle.flushes_sent, time.monotonic() - t0)
 
     async def drive():
         nonlocal final_data
@@ -393,14 +411,22 @@ async def _run_speaking(
             await outbound_q.put(("json", {"type": "bot_text_chunk", "text": fixed_text}))
             await _send_and_flush(fixed_text)
             final_data["reply_text"] = fixed_text
+            speech_flushed.set()
         else:
             async for event in session.handle_user_turn_stream(user_transcript):
                 if event["type"] == "speech_chunk":
                     await outbound_q.put(("json", {"type": "bot_text_chunk", "text": event["text"]}))
                     await _send_and_flush(event["text"])
+                elif event["type"] == "speech_done":
+                    speech_flushed.set()
                 else:
                     final_data = event["data"]
+            speech_flushed.set()  # belt and suspenders - covers any path that reaches "final" without a "speech_done" (e.g. session.ended's early-return)
         llm_done.set()
+        logger.info(
+            "drive() done (flushes_sent=%d, completions_seen=%d)",
+            handle.flushes_sent, handle.completions_seen,
+        )
 
     async def forward():
         # Deliberately a plain `async for`, not asyncio.wait_for()-wrapped polling - see the
@@ -419,11 +445,22 @@ async def _run_speaking(
                 await outbound_q.put(("bytes", tts_event["data"]))
             elif tts_event["kind"] == "final":
                 handle.completions_seen += 1
-                if llm_done.is_set() and handle.completions_seen >= handle.flushes_sent:
+                logger.info(
+                    "TTS final #%d (flushes_sent=%d, speech_flushed=%s)",
+                    handle.completions_seen, handle.flushes_sent, speech_flushed.is_set(),
+                )
+                # speech_flushed, not llm_done - see the comment where speech_flushed is declared.
+                if speech_flushed.is_set() and handle.completions_seen >= handle.flushes_sent:
                     return
             elif tts_event["kind"] == "error":
                 logger.warning("Sarvam TTS error: %s", tts_event["raw"])
                 return
+            else:
+                # Not currently expected on the happy path - logged rather than silently dropped,
+                # since an unrecognized message here would otherwise look identical to "forward()
+                # is just waiting for the next event" in the logs, the exact ambiguity that made a
+                # real 20s stuck-speaking recovery hard to diagnose after the fact.
+                logger.warning("Unexpected Sarvam TTS event kind=%r: %s", tts_event["kind"], tts_event.get("raw"))
 
     try:
         await asyncio.wait_for(asyncio.gather(drive(), forward()), timeout=_SPEAKING_TIMEOUT_S)

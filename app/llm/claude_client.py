@@ -181,6 +181,16 @@ class ClaudeClient:
             speech_parts.append(chunk)
             yield {"type": "speech_chunk", "text": chunk}
 
+        # Marks "no more speech_chunks are coming" separately from "the turn is fully done" -
+        # app/streaming/call_ws_handler.py's forward() needs the EARLIER signal to decide it can
+        # stop waiting on TTS, since _classify_turn() below is a real API call that can easily
+        # take longer than Sarvam takes to finish synthesizing what's already been flushed. Without
+        # this, forward() only re-checks its exit condition when a NEW TTS event arrives - if every
+        # expected 'final' had already arrived before classification finishes, nothing would ever
+        # wake it up again, and the turn would hang until the 20s safety-net timeout. Confirmed on
+        # two real calls (see call_ws_handler.py's _SPEAKING_TIMEOUT_S comment).
+        yield {"type": "speech_done"}
+
         reply_text = " ".join(speech_parts).strip()
         classification = await self._classify_turn(history, current_question, reply_text)
 

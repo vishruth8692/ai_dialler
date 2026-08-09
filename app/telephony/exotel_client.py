@@ -10,6 +10,8 @@ before it was relied on.
 """
 
 import logging
+from typing import Optional
+from urllib.parse import urlencode
 
 import requests
 
@@ -47,9 +49,18 @@ def missing_settings() -> list[str]:
     return [name for name, value in settings.items() if not value]
 
 
-def place_call(to_number: str) -> dict:
+def place_call(
+    to_number: str,
+    dial_record: Optional[dict] = None,
+    stream_path: str = "/telephony/exotel-stream",
+) -> dict:
     """Places an outbound call to `to_number`, streaming its audio bidirectionally to our
-    /telephony/exotel-stream WebSocket once answered. Returns Exotel's response JSON.
+    `stream_path` WebSocket once answered (defaults to the Zepto feedback bot's; the attrition bot
+    passes "/attrition/exotel-stream"). Returns Exotel's response JSON.
+
+    `dial_record` (rider_name, rider_code, city, ...) is encoded into the StreamUrl query string -
+    Exotel echoes back whatever's in the URL we give it, so the receiving WebSocket can read it
+    straight off `websocket.query_params` without any server-side session lookup by call SID.
 
     Raises ExotelNotConfigured if required settings are missing, or requests.HTTPError on failure.
     """
@@ -59,7 +70,8 @@ def place_call(to_number: str) -> dict:
     # sample-rate=16000 matches what Sarvam's STT WebSocket requires (see
     # app/streaming/sarvam_stt_ws.py) so no resampling is needed on audio coming from the caller.
     base = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
-    stream_url = f"{base}/telephony/exotel-stream?sample-rate=16000"
+    query = {"sample-rate": "16000", **(dial_record or {})}
+    stream_url = f"{base}{stream_path}?{urlencode(query)}"
 
     # Logged unconditionally (not just on error) since this is the one piece of information that
     # actually explains whether Exotel was ever given a usable StreamUrl - PUBLIC_BASE_URL being

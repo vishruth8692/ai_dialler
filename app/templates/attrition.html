@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AI Dialler — Rider Attrition Calls</title>
+  <style>
+    body { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.3rem; margin-bottom: 0.25rem; }
+    .sub { color: #666; font-size: 0.85rem; margin-bottom: 1rem; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1.25rem; margin-bottom: 1.25rem; }
+    .card h2 { font-size: 1rem; margin-top: 0; }
+    .msg { padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }
+    .msg.ok { background: #e6f4ea; color: #1e4620; }
+    .msg.err { background: #fdecea; color: #611a15; }
+    .checklist { list-style: none; padding: 0; margin: 0; }
+    .checklist li { padding: 0.35rem 0; font-size: 0.9rem; display: flex; align-items: center; gap: 0.5rem; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+    .dot.set { background: #1e8e3e; }
+    .dot.missing { background: #d93025; }
+    code { background: #f1f1f1; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85rem; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(200px, 1fr)); gap: 0.6rem 1rem; margin-bottom: 0.75rem; }
+    input[type=tel], input[type=text] { padding: 0.6rem 0.7rem; border: 1px solid #ccc; border-radius: 6px; font-size: 0.95rem; width: 100%; box-sizing: border-box; }
+    label { display: block; font-size: 0.78rem; color: #666; margin-bottom: 0.2rem; }
+    button { background: #0b5fff; color: #fff; border: none; padding: 0.6rem 1.1rem; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+    button:disabled { background: #ccc; cursor: default; }
+    .hint { color: #666; font-size: 0.85rem; }
+    nav { font-size: 0.85rem; margin-bottom: 1rem; }
+    nav a { color: #0b5fff; text-decoration: none; margin-right: 1rem; }
+
+    #monitor-status { font-size: 0.85rem; color: #666; margin-bottom: 0.5rem; }
+    #monitor-status .live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #1e8e3e; margin-right: 0.4rem; animation: pulse-green 1.6s infinite; }
+    #monitor-status .idle-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #bbb; margin-right: 0.4rem; }
+    @keyframes pulse-green { 0% { box-shadow: 0 0 0 0 rgba(30,142,62,0.5); } 70% { box-shadow: 0 0 0 8px rgba(30,142,62,0); } 100% { box-shadow: 0 0 0 0 rgba(30,142,62,0); } }
+    #log { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; height: 340px; overflow-y: auto; background: #fafafa; display: flex; flex-direction: column; gap: 0.6rem; }
+    .bubble { max-width: 85%; padding: 0.55rem 0.8rem; border-radius: 12px; font-size: 0.92rem; line-height: 1.35; white-space: pre-wrap; }
+    .bot { align-self: flex-start; background: #e9e9eb; color: #1a1a1a; border-bottom-left-radius: 3px; }
+    .rider { align-self: flex-end; background: #0b5fff; color: #fff; border-bottom-right-radius: 3px; }
+    .rider.barge-in { background: #b5170f; }
+    .system { align-self: center; color: #888; font-size: 0.8rem; font-style: italic; }
+    .debug { align-self: center; background: #fff3cd; color: #664d03; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem; padding: 0.3rem 0.6rem; border-radius: 6px; max-width: 95%; white-space: pre-wrap; }
+    #answers { margin-top: 1rem; }
+    #answers h3 { font-size: 0.9rem; margin-bottom: 0.3rem; }
+    #answers ul { padding-left: 1.1rem; font-size: 0.85rem; margin: 0; }
+
+    .call-list { display: flex; flex-direction: column; }
+    .call-entry { display: flex; gap: 1.25rem; padding: 1rem 0; border-bottom: 1px solid #eee; }
+    .call-entry:last-child { border-bottom: none; }
+    .call-summary { flex: 1 1 40%; min-width: 0; }
+    .call-summary .phone { font-weight: 600; }
+    .call-summary .when { color: #666; font-size: 0.8rem; margin-bottom: 0.5rem; }
+    .tag-chip { display: inline-block; background: #eef2ff; color: #3730a3; border-radius: 999px; padding: 0.15rem 0.6rem; font-size: 0.75rem; margin: 0 0.3rem 0.3rem 0; }
+    .tag-chip.severity-high { background: #fdecea; color: #611a15; }
+    .tag-chip.severity-medium { background: #fff3cd; color: #664d03; }
+    .tag-chip.flag { background: #fdecea; color: #611a15; }
+    .record-field { font-size: 0.82rem; margin: 0.15rem 0; }
+    .record-field strong { color: #444; }
+    .call-transcript { flex: 1 1 60%; min-width: 0; max-height: 260px; overflow-y: auto; background: #fafafa; border: 1px solid #eee; border-radius: 8px; padding: 0.75rem; display: flex; flex-direction: column; gap: 0.5rem; }
+    .call-transcript .bubble { max-width: 90%; font-size: 0.82rem; }
+    .empty { color: #888; font-style: italic; font-size: 0.9rem; }
+
+    .flow { display: flex; flex-direction: column; }
+    details.flow-node { border: 1px solid #ddd; border-radius: 8px; padding: 0.7rem 1rem; background: #fff; }
+    details.flow-node.safety { border-color: #d93025; background: #fff8f7; }
+    details.flow-node > summary { cursor: pointer; list-style: revert; }
+    details.flow-node[open] > summary { margin-bottom: 0.6rem; }
+    .flow-node .node-header { display: inline-flex; align-items: center; gap: 0.5rem; }
+    .flow-node .node-title { font-weight: 600; font-size: 0.92rem; }
+    .flow-node.safety .node-title { color: #b5170f; }
+    .node-badge { font-size: 0.7rem; padding: 0.1rem 0.55rem; border-radius: 999px; background: #eef2ff; color: #3730a3; white-space: nowrap; }
+    .node-badge.custom { background: #fff3cd; color: #664d03; }
+    .flow-node textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; line-height: 1.45; padding: 0.6rem; border: 1px solid #ccc; border-radius: 6px; resize: vertical; min-height: 100px; }
+    .node-footer { margin-top: 0.5rem; display: flex; justify-content: flex-end; gap: 0.5rem; }
+    .save-btn { padding: 0.3rem 0.8rem; font-size: 0.78rem; border-radius: 6px; }
+    .reset-btn { background: none; border: 1px solid #ccc; color: #666; padding: 0.25rem 0.6rem; font-size: 0.75rem; border-radius: 6px; cursor: pointer; }
+    .reset-btn:hover { background: #f5f5f5; }
+    .flow-arrow { display: flex; flex-direction: column; align-items: center; padding: 0.3rem 0; color: #888; font-size: 0.76rem; }
+    .flow-arrow .line { width: 2px; height: 12px; background: #ccc; }
+    .flow-arrow .label { background: #fff; padding: 0.1rem 0.6rem; border: 1px solid #eee; border-radius: 999px; margin: 0.1rem 0; }
+    .flow-placeholder-hint { font-size: 0.76rem; color: #444; background: #f5f6ff; border: 1px solid #dfe2fa; border-radius: 6px; padding: 0.45rem 0.65rem; margin-top: 0.55rem; }
+    .flow-side-note { font-size: 0.78rem; color: #a15c00; background: #fff8e6; border: 1px solid #ffe8b0; border-radius: 6px; padding: 0.5rem 0.7rem; margin-top: 0.6rem; }
+    .flow-safety-connector { display: flex; align-items: center; gap: 0.6rem; color: #b5170f; font-size: 0.76rem; padding: 0.6rem 0; }
+    .flow-safety-connector .line { flex: 1; border-top: 2px dashed #f3b4ae; }
+    .flow-save-status { font-size: 0.85rem; margin-top: 0.75rem; display: block; }
+    .flow-save-status.ok { color: #1e8e3e; }
+    .flow-save-status.err { color: #b5170f; }
+
+    .qa-list { display: flex; flex-direction: column; gap: 0.6rem; margin-bottom: 1rem; }
+    .qa-pair { border: 1px solid #eee; border-radius: 8px; padding: 0.7rem 0.9rem; background: #fafafa; }
+    .qa-pair .qa-question { font-weight: 600; font-size: 0.85rem; margin-bottom: 0.25rem; }
+    .qa-pair .qa-answer { font-size: 0.85rem; color: #333; white-space: pre-wrap; }
+    .qa-pair .node-footer { margin-top: 0.5rem; }
+    .qa-add-form textarea { width: 100%; box-sizing: border-box; font-size: 0.88rem; padding: 0.6rem 0.7rem; border: 1px solid #ccc; border-radius: 6px; resize: vertical; min-height: 70px; font-family: inherit; }
+    .qa-add-form > div { margin-bottom: 0.6rem; }
+    .qa-upload-form { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid #eee; }
+    .qa-upload-form input[type=file] { font-size: 0.85rem; margin: 0.4rem 0.6rem 0.4rem 0; }
+  </style>
+</head>
+<body>
+  <nav><a href="/qa">Q&amp;A content</a><a href="/attrition">Attrition calls</a></nav>
+  <h1>Rider Attrition Calls</h1>
+  <div class="sub">Calls riders who've stopped delivering to understand why - no commitments, no admissions, feedback only.</div>
+
+  {% if message %}<div class="msg ok">{{ message }}</div>{% endif %}
+  {% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+
+  <div class="card">
+    <details {{ "open" if not configured else "" }}>
+      <summary style="cursor:pointer; font-size:1rem; font-weight:600;">Setup status</summary>
+      <ul class="checklist" style="margin-top:0.75rem;">
+        {% for name, is_set in settings_status %}
+        <li><span class="dot {{ 'set' if is_set else 'missing' }}"></span> <code>{{ name }}</code> {{ 'configured' if is_set else 'missing' }}</li>
+        {% endfor %}
+      </ul>
+      {% if not configured %}
+      <p class="hint">
+        Set the missing values above in <code>.env</code>. This bot shares the same Exotel account
+        and number as the Zepto feedback bot on /telephony. Ordinary side-questions (money, ID,
+        "connect me to someone") are handled by pointing riders to raising a support ticket in the
+        Zepto app - no config needed for that. <code>ATTRITION_SAFETY_HELPLINE</code> is still a
+        hard requirement, not just a warning: it's only used for the safety hard-stop (injury,
+        accident, assault disclosures), and calls are blocked until it's set.
+      </p>
+      {% endif %}
+    </details>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary style="cursor:pointer; font-size:1rem; font-weight:600;">Call flow</summary>
+      <p class="hint" style="margin-top:0.75rem;">
+        Each section is what the bot is told to ask at that stage - expand one, edit the wording,
+        and click its Save button. Changes apply to the very next call turn, no restart needed. The
+        arrows (which stage follows which) aren't editable here, only the wording inside each box is.
+      </p>
+      <div class="flow" id="attrition-flow">
+        {% for node in stage_flow.main %}
+        {% if not loop.first %}
+        <div class="flow-arrow">
+          <div class="line"></div>
+          <div class="label">{{ node.arrow_in }}</div>
+          <div class="line"></div>
+        </div>
+        {% endif %}
+        <details class="flow-node" data-stage="{{ node.key }}">
+          <summary>
+            <span class="node-header">
+              <span class="node-title">{{ node.label }}</span>
+              <span class="node-badge {{ '' if node.is_default else 'custom' }}" data-role="badge">{{ 'default' if node.is_default else 'edited' }}</span>
+            </span>
+          </summary>
+          <textarea data-stage-text spellcheck="false">{{ node.text }}</textarea>
+          {% if node.placeholder_hint %}<div class="flow-placeholder-hint">{{ node.placeholder_hint }}</div>{% endif %}
+          {% if node.side_note %}<div class="flow-side-note">{{ node.side_note }}</div>{% endif %}
+          <div class="node-footer">
+            <button type="button" class="reset-btn" data-reset="{{ node.key }}">Reset to default</button>
+            <button type="button" class="save-btn" data-save="{{ node.key }}">Save</button>
+          </div>
+        </details>
+        {% endfor %}
+
+        <div class="flow-safety-connector">
+          <div class="line"></div>
+          <span>⚠ {{ stage_flow.safety.arrow_in }}</span>
+          <div class="line"></div>
+        </div>
+
+        <details class="flow-node safety" data-stage="{{ stage_flow.safety.key }}">
+          <summary>
+            <span class="node-header">
+              <span class="node-title">{{ stage_flow.safety.label }}</span>
+              <span class="node-badge {{ '' if stage_flow.safety.is_default else 'custom' }}" data-role="badge">{{ 'default' if stage_flow.safety.is_default else 'edited' }}</span>
+            </span>
+          </summary>
+          <textarea data-stage-text spellcheck="false">{{ stage_flow.safety.text }}</textarea>
+          <div class="flow-placeholder-hint">{{ stage_flow.safety.placeholder_hint }}</div>
+          <div class="node-footer">
+            <button type="button" class="reset-btn" data-reset="{{ stage_flow.safety.key }}">Reset to default</button>
+            <button type="button" class="save-btn" data-save="{{ stage_flow.safety.key }}">Save</button>
+          </div>
+        </details>
+      </div>
+      <span class="flow-save-status" id="flow-save-status"></span>
+    </details>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary style="cursor:pointer; font-size:1rem; font-weight:600;">Rider Q&amp;A knowledge base ({{ qa_pairs|length }})</summary>
+      <p class="hint" style="margin-top:0.75rem;">
+        Answers the bot can draw on when a rider asks something off-script (money, ID, how
+        something works). It answers briefly in its own words, never verbatim - if a question isn't
+        covered here, it falls back to its default "I don't have that on this call" line.
+      </p>
+      <div class="qa-list" id="qa-list">
+        {% for pair in qa_pairs %}
+        <div class="qa-pair" data-index="{{ loop.index0 }}">
+          <div class="qa-question">Q: {{ pair.question }}</div>
+          <div class="qa-answer">A: {{ pair.answer }}</div>
+          <div class="node-footer">
+            <button type="button" class="reset-btn" data-qa-delete="{{ loop.index0 }}">Delete</button>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% if not qa_pairs %}<p class="empty" id="qa-empty">No Q&amp;A pairs yet.</p>{% endif %}
+      <div class="qa-add-form">
+        <div>
+          <label for="qa-question-input">Question</label>
+          <input type="text" id="qa-question-input" placeholder="e.g. Kya mera ID block ho jayega?">
+        </div>
+        <div>
+          <label for="qa-answer-input">Answer</label>
+          <textarea id="qa-answer-input" placeholder="What the bot should say, in its own words - it won't read this out verbatim"></textarea>
+        </div>
+        <button type="button" id="qa-add-btn">Add</button>
+        <span class="flow-save-status" id="qa-status"></span>
+      </div>
+
+      <div class="qa-upload-form">
+        <label for="qa-csv-input">Or bulk-add from a CSV</label>
+        <p class="hint" style="margin: 0.2rem 0 0.5rem;">
+          Columns: <code>question</code>, <code>answer</code>. Adds to the list above - doesn't
+          replace it, so you can upload more than once to keep topping it up.
+        </p>
+        <input type="file" id="qa-csv-input" accept=".csv">
+        <button type="button" id="qa-upload-btn">Upload CSV</button>
+        <span class="flow-save-status" id="qa-upload-status"></span>
+      </div>
+    </details>
+  </div>
+
+  <div class="card">
+    <h2>Place a call</h2>
+    {% if configured %}
+    <form action="/attrition/call" method="post">
+      <div class="form-grid">
+        <div>
+          <label for="to_number">Phone number *</label>
+          <input type="tel" id="to_number" name="to_number" placeholder="+91XXXXXXXXXX" required>
+        </div>
+        <div>
+          <label for="rider_name">Rider name</label>
+          <input type="text" id="rider_name" name="rider_name" placeholder="Used for the identity check">
+        </div>
+        <div>
+          <label for="rider_code">Rider code</label>
+          <input type="text" id="rider_code" name="rider_code">
+        </div>
+        <div>
+          <label for="city">City</label>
+          <input type="text" id="city" name="city">
+        </div>
+        <div>
+          <label for="store_name">Store name</label>
+          <input type="text" id="store_name" name="store_name">
+        </div>
+        <div>
+          <label for="preferred_language">Preferred language</label>
+          <input type="text" id="preferred_language" name="preferred_language" placeholder="e.g. hindi, marathi">
+        </div>
+      </div>
+      <button type="submit" id="single-call-btn">Call</button>
+    </form>
+
+    <div class="qa-upload-form">
+      <label for="bulk-csv-input">Or bulk-call from a CSV</label>
+      <p class="hint" style="margin: 0.2rem 0 0.5rem;">
+        Columns: <code>phone_number</code> (required - 10 digits, with or without a +91/0 prefix),
+        plus optional <code>rider_name</code>, <code>rider_code</code>, <code>city</code>,
+        <code>store_name</code>, <code>preferred_language</code>. Calls are placed one at a time -
+        each one waits for the previous to finish, plus a 30 second gap, before the next starts.
+      </p>
+      <input type="file" id="bulk-csv-input" accept=".csv">
+      <button type="button" id="bulk-upload-btn">Upload &amp; queue calls</button>
+      <span class="flow-save-status" id="bulk-upload-status"></span>
+
+      <div id="queue-status-box" style="display:none; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #eee;">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap: 1rem; flex-wrap: wrap;">
+          <strong id="queue-status-text" style="font-size:0.88rem;"></strong>
+          <span>
+            <button type="button" class="reset-btn" id="queue-clear-btn" style="display:none;">Stop after current call</button>
+            <button type="button" class="reset-btn" id="queue-reset-btn" style="display:none;">Clear history</button>
+          </span>
+        </div>
+        <div id="queue-done-list" style="margin-top:0.6rem; font-size:0.82rem; max-height:180px; overflow-y:auto;"></div>
+      </div>
+    </div>
+    {% else %}
+    <button disabled>Call</button>
+    <p class="hint">Complete the setup checklist above first.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2 style="display:flex; align-items:center; gap:0.6rem;">
+      Live call view
+      <span id="call-number" class="hint" style="display:none; font-weight:400;"></span>
+    </h2>
+    <div id="monitor-status">Connecting...</div>
+    <div id="log"></div>
+    <div id="answers"></div>
+  </div>
+
+  <div class="card">
+    <h2 style="display:flex; align-items:center; justify-content:space-between; gap:1rem;">
+      <span>Calls made ({{ history|length }})</span>
+      {% if history %}
+      <span style="font-size:0.8rem; font-weight:400;">
+        <a href="/attrition/calls/export.csv" style="color:#0b5fff; text-decoration:none; margin-right:0.9rem;">Download CSV</a>
+        <a href="/attrition/calls/export.json" style="color:#0b5fff; text-decoration:none;">Download JSON</a>
+      </span>
+      {% endif %}
+    </h2>
+    {% if not history %}
+    <p class="empty">No attrition calls yet.</p>
+    {% else %}
+    <div class="call-list">
+      {% for call in history %}
+      {% set rec = call.structured_record %}
+      <div class="call-entry">
+        <div class="call-summary">
+          <div class="phone">{{ call.dial_record.rider_name or call.phone_number or "Unknown rider" }}</div>
+          <div class="when">{{ call.started_at }}</div>
+          {% if rec %}
+          <div>
+            {% if rec.status_gate %}<span class="tag-chip">{{ rec.status_gate }}</span>{% endif %}
+            {% if rec.primary_reason_l1 %}<span class="tag-chip">{{ rec.primary_reason_l1 }}</span>{% endif %}
+            {% if rec.primary_reason_l2 %}<span class="tag-chip">{{ rec.primary_reason_l2 }}</span>{% endif %}
+            {% if rec.severity and rec.severity != 'low' %}<span class="tag-chip severity-{{ rec.severity }}">severity: {{ rec.severity }}</span>{% endif %}
+            {% if rec.welfare_flag %}<span class="tag-chip flag">welfare flag</span>{% endif %}
+            {% if rec.fraud_report %}<span class="tag-chip flag">fraud report</span>{% endif %}
+            {% if rec.do_not_call %}<span class="tag-chip flag">do not call</span>{% endif %}
+          </div>
+          {% if rec.internal_note %}<div class="record-field"><strong>Note:</strong> {{ rec.internal_note }}</div>{% endif %}
+          {% if rec.last_straw %}<div class="record-field"><strong>Last straw:</strong> {{ rec.last_straw }}</div>{% endif %}
+          {% if rec.internal_route %}<div class="record-field"><strong>Route to:</strong> {{ rec.internal_route }}</div>{% endif %}
+          {% else %}
+          <p class="hint">Not yet classified.</p>
+          {% endif %}
+        </div>
+        <div class="call-transcript">
+          {% for turn in call.transcript %}
+          <div class="bubble {{ 'bot' if turn.role == 'bot' else ('rider barge-in' if turn.barge_in else 'rider') }}" style="align-self: {{ 'flex-start' if turn.role == 'bot' else 'flex-end' }};">{{ turn.text }}</div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+
+  <script>
+    if (location.search) {
+      history.replaceState(null, "", location.pathname);
+    }
+
+    const logEl = document.getElementById("log");
+    const answersDiv = document.getElementById("answers");
+    const monitorStatus = document.getElementById("monitor-status");
+    const callNumberDiv = document.getElementById("call-number");
+
+    let currentBotBubble = null;
+
+    function addBubble(text, cls) {
+      if (!text) return null;
+      const div = document.createElement("div");
+      div.className = "bubble " + cls;
+      div.textContent = text;
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+      return div;
+    }
+
+    function addSystem(text) { addBubble(text, "system"); }
+
+    function addDebug(msg) {
+      const lines = [];
+      if (msg.tool_name) lines.push(`signal: ${msg.tool_name}`);
+      if (msg.answer_summary) lines.push(`captured: "${msg.answer_summary}"`);
+      if (!lines.length) return;
+      const div = document.createElement("div");
+      div.className = "bubble debug";
+      div.textContent = lines.join("\n");
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    function renderAnswers(answers) {
+      if (!answers || !answers.length) { answersDiv.innerHTML = ""; return; }
+      const items = answers.map(a => `<li><strong>${escapeHtml(a.question)}</strong>: ${escapeHtml(a.answer)}</li>`).join("");
+      answersDiv.innerHTML = `<h3>Collected answers</h3><ul>${items}</ul>`;
+    }
+
+    function connectMonitor() {
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${protocol}//${location.host}/attrition/monitor-ws`);
+
+      ws.onopen = () => {
+        monitorStatus.innerHTML = '<span class="idle-dot"></span>No call in progress';
+      };
+      ws.onclose = () => {
+        monitorStatus.textContent = "Disconnected — reconnecting...";
+        setTimeout(connectMonitor, 2000);
+      };
+      ws.onerror = () => { ws.close(); };
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        switch (msg.type) {
+          case "call_lifecycle":
+            if (msg.status === "started") {
+              logEl.innerHTML = "";
+              answersDiv.innerHTML = "";
+              currentBotBubble = null;
+              monitorStatus.innerHTML = '<span class="live-dot"></span>Call in progress';
+              callNumberDiv.style.display = "none";
+              callNumberDiv.textContent = "";
+              addSystem("Call started");
+            } else if (msg.status === "ended") {
+              monitorStatus.innerHTML = '<span class="idle-dot"></span>No call in progress';
+              callNumberDiv.style.display = "none";
+              addSystem("Call ended");
+            }
+            break;
+          case "call_info":
+            if (msg.phone_number) {
+              callNumberDiv.textContent = `(${msg.phone_number})`;
+              callNumberDiv.style.display = "inline";
+            }
+            break;
+          case "bot_text_chunk":
+            if (!currentBotBubble) {
+              currentBotBubble = document.createElement("div");
+              currentBotBubble.className = "bubble bot";
+              logEl.appendChild(currentBotBubble);
+            }
+            currentBotBubble.textContent += (currentBotBubble.textContent ? " " : "") + msg.text;
+            logEl.scrollTop = logEl.scrollHeight;
+            break;
+          case "transcript":
+            addBubble(msg.text, msg.barge_in ? "rider barge-in" : "rider");
+            break;
+          case "control":
+            addDebug(msg);
+            renderAnswers(msg.collected_answers);
+            break;
+          case "reply_done":
+            currentBotBubble = null;
+            break;
+          case "bot_state":
+            break;
+        }
+      };
+    }
+
+    connectMonitor();
+
+    const flowEl = document.getElementById("attrition-flow");
+    const saveStatus = document.getElementById("flow-save-status");
+
+    function setBadge(nodeEl, isDefault) {
+      const badge = nodeEl.querySelector('[data-role="badge"]');
+      badge.textContent = isDefault ? "default" : "edited";
+      badge.className = "node-badge" + (isDefault ? "" : " custom");
+    }
+
+    flowEl.addEventListener("click", async (event) => {
+      const saveBtn = event.target.closest("[data-save]");
+      const resetBtn = event.target.closest("[data-reset]");
+      if (!saveBtn && !resetBtn) return;
+
+      if (saveBtn) {
+        const stage = saveBtn.dataset.save;
+        const nodeEl = flowEl.querySelector(`.flow-node[data-stage="${stage}"]`);
+        const text = nodeEl.querySelector("[data-stage-text]").value;
+        saveStatus.textContent = "Saving...";
+        saveStatus.className = "flow-save-status";
+        try {
+          const res = await fetch("/attrition/stages", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ stages: { [stage]: text } }),
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) {
+            const firstError = data.errors ? Object.values(data.errors)[0] : "Save failed.";
+            saveStatus.textContent = firstError;
+            saveStatus.className = "flow-save-status err";
+            return;
+          }
+          setBadge(nodeEl, text === data.defaults[stage]);
+          saveStatus.textContent = `${nodeEl.querySelector(".node-title").textContent} saved - used from the next call turn onward.`;
+          saveStatus.className = "flow-save-status ok";
+        } catch (err) {
+          saveStatus.textContent = "Save failed: " + err;
+          saveStatus.className = "flow-save-status err";
+        }
+        return;
+      }
+
+      const stage = resetBtn.dataset.reset;
+      saveStatus.textContent = "Resetting...";
+      saveStatus.className = "flow-save-status";
+      try {
+        const res = await fetch("/attrition/stages/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ stage }),
+        });
+        const data = await res.json();
+        const nodeEl = flowEl.querySelector(`.flow-node[data-stage="${stage}"]`);
+        nodeEl.querySelector("[data-stage-text]").value = data.defaults[stage];
+        setBadge(nodeEl, true);
+        saveStatus.textContent = "Reset to default.";
+        saveStatus.className = "flow-save-status ok";
+      } catch (err) {
+        saveStatus.textContent = "Reset failed: " + err;
+        saveStatus.className = "flow-save-status err";
+      }
+    });
+
+    flowEl.addEventListener("input", (event) => {
+      const textarea = event.target.closest("[data-stage-text]");
+      if (!textarea) return;
+      saveStatus.textContent = "";
+    });
+
+    const qaListEl = document.getElementById("qa-list");
+    const qaEmptyEl = document.getElementById("qa-empty");
+    const qaQuestionInput = document.getElementById("qa-question-input");
+    const qaAnswerInput = document.getElementById("qa-answer-input");
+    const qaAddBtn = document.getElementById("qa-add-btn");
+    const qaStatus = document.getElementById("qa-status");
+
+    function renderQaList(pairs) {
+      qaListEl.innerHTML = pairs
+        .map(
+          (pair, index) => `
+        <div class="qa-pair" data-index="${index}">
+          <div class="qa-question">Q: ${escapeHtml(pair.question)}</div>
+          <div class="qa-answer">A: ${escapeHtml(pair.answer)}</div>
+          <div class="node-footer">
+            <button type="button" class="reset-btn" data-qa-delete="${index}">Delete</button>
+          </div>
+        </div>`
+        )
+        .join("");
+      if (qaEmptyEl) qaEmptyEl.style.display = pairs.length ? "none" : "block";
+      const summary = qaListEl.closest("details").querySelector("summary");
+      summary.textContent = `Rider Q&A knowledge base (${pairs.length})`;
+    }
+
+    qaAddBtn.addEventListener("click", async () => {
+      const question = qaQuestionInput.value.trim();
+      const answer = qaAnswerInput.value.trim();
+      if (!question || !answer) {
+        qaStatus.textContent = "Both question and answer are required.";
+        qaStatus.className = "flow-save-status err";
+        return;
+      }
+      qaStatus.textContent = "Adding...";
+      qaStatus.className = "flow-save-status";
+      try {
+        const res = await fetch("/attrition/qa", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question, answer }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          qaStatus.textContent = data.error || "Could not add that pair.";
+          qaStatus.className = "flow-save-status err";
+          return;
+        }
+        renderQaList(data.pairs);
+        qaQuestionInput.value = "";
+        qaAnswerInput.value = "";
+        qaStatus.textContent = "Added - used from the next call turn onward.";
+        qaStatus.className = "flow-save-status ok";
+      } catch (err) {
+        qaStatus.textContent = "Add failed: " + err;
+        qaStatus.className = "flow-save-status err";
+      }
+    });
+
+    qaListEl.addEventListener("click", async (event) => {
+      const btn = event.target.closest("[data-qa-delete]");
+      if (!btn) return;
+      const index = parseInt(btn.dataset.qaDelete, 10);
+      qaStatus.textContent = "Deleting...";
+      qaStatus.className = "flow-save-status";
+      try {
+        const res = await fetch("/attrition/qa/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ index }),
+        });
+        const data = await res.json();
+        renderQaList(data.pairs);
+        qaStatus.textContent = "Deleted.";
+        qaStatus.className = "flow-save-status ok";
+      } catch (err) {
+        qaStatus.textContent = "Delete failed: " + err;
+        qaStatus.className = "flow-save-status err";
+      }
+    });
+
+    const qaCsvInput = document.getElementById("qa-csv-input");
+    const qaUploadBtn = document.getElementById("qa-upload-btn");
+    const qaUploadStatus = document.getElementById("qa-upload-status");
+
+    qaUploadBtn.addEventListener("click", async () => {
+      const file = qaCsvInput.files[0];
+      if (!file) {
+        qaUploadStatus.textContent = "Choose a CSV file first.";
+        qaUploadStatus.className = "flow-save-status err";
+        return;
+      }
+      qaUploadStatus.textContent = "Uploading...";
+      qaUploadStatus.className = "flow-save-status";
+      try {
+        const formData = new FormData();
+        formData.append("file", file);
+        const res = await fetch("/attrition/qa/upload", { method: "POST", body: formData });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          qaUploadStatus.textContent = data.error || "Upload failed.";
+          qaUploadStatus.className = "flow-save-status err";
+          return;
+        }
+        renderQaList(data.pairs);
+        qaCsvInput.value = "";
+        qaUploadStatus.textContent = `Added ${data.added} pair${data.added === 1 ? "" : "s"} from the CSV.`;
+        qaUploadStatus.className = "flow-save-status ok";
+      } catch (err) {
+        qaUploadStatus.textContent = "Upload failed: " + err;
+        qaUploadStatus.className = "flow-save-status err";
+      }
+    });
+
+    const bulkUploadBtn = document.getElementById("bulk-upload-btn");
+    if (bulkUploadBtn) {
+      // Only rendered when the setup checklist is complete (see the "configured" guard around
+      // this whole section) - guarded so this block doesn't throw on pages where it's absent and
+      // break the rest of the script that follows it.
+      const bulkCsvInput = document.getElementById("bulk-csv-input");
+      const bulkUploadStatus = document.getElementById("bulk-upload-status");
+      const singleCallBtn = document.getElementById("single-call-btn");
+      const queueStatusBox = document.getElementById("queue-status-box");
+      const queueStatusText = document.getElementById("queue-status-text");
+      const queueDoneList = document.getElementById("queue-done-list");
+      const queueClearBtn = document.getElementById("queue-clear-btn");
+      const queueResetBtn = document.getElementById("queue-reset-btn");
+      let queuePollTimer = null;
+
+      function renderQueueStatus(status) {
+        const hasActivity = status.running || status.pending_count > 0 || status.done.length > 0;
+        queueStatusBox.style.display = hasActivity ? "block" : "none";
+        if (singleCallBtn) singleCallBtn.disabled = status.running;
+        if (!hasActivity) return;
+
+        const calledCount = status.done.filter((d) => d.status === "called").length;
+        const failedCount = status.done.filter((d) => d.status === "failed").length;
+        if (status.running) {
+          queueStatusText.textContent = `Bulk calling: ${status.done.length}/${status.total} done (${calledCount} called, ${failedCount} failed), ${status.pending_count} remaining - next call in up to 30s after the current one ends.`;
+        } else if (status.pending_count > 0) {
+          queueStatusText.textContent = `Paused: ${status.pending_count} call(s) still queued.`;
+        } else {
+          queueStatusText.textContent = `Done: ${calledCount} called, ${failedCount} failed, out of ${status.total}.`;
+        }
+
+        queueDoneList.innerHTML = status.done
+          .slice()
+          .reverse()
+          .map((d) => {
+            const ok = d.status === "called";
+            const detail = ok ? "" : ` - ${escapeHtml(d.error || "")}`;
+            return `<div class="${ok ? "" : "flow-save-status err"}">${ok ? "✓" : "✗"} ${escapeHtml(d.to_number)}${detail}</div>`;
+          })
+          .join("");
+
+        queueClearBtn.style.display = status.running ? "inline-block" : "none";
+        queueResetBtn.style.display = !status.running && status.done.length > 0 ? "inline-block" : "none";
+      }
+
+      async function pollQueueStatus() {
+        try {
+          const res = await fetch("/attrition/calls/queue-status");
+          const status = await res.json();
+          renderQueueStatus(status);
+          if (status.running) {
+            queuePollTimer = setTimeout(pollQueueStatus, 4000);
+          }
+        } catch (err) {
+          // Silent - the next manual action (upload/clear/reset) or a page reload will retry.
+        }
+      }
+
+      pollQueueStatus();
+
+      bulkUploadBtn.addEventListener("click", async () => {
+        const file = bulkCsvInput.files[0];
+        if (!file) {
+          bulkUploadStatus.textContent = "Choose a CSV file first.";
+          bulkUploadStatus.className = "flow-save-status err";
+          return;
+        }
+        bulkUploadStatus.textContent = "Uploading...";
+        bulkUploadStatus.className = "flow-save-status";
+        try {
+          const formData = new FormData();
+          formData.append("file", file);
+          const res = await fetch("/attrition/calls/upload", { method: "POST", body: formData });
+          const data = await res.json();
+          if (!res.ok || !data.ok) {
+            bulkUploadStatus.textContent = data.error || "Upload failed.";
+            bulkUploadStatus.className = "flow-save-status err";
+            return;
+          }
+          bulkCsvInput.value = "";
+          let msg = `Queued ${data.enqueued} call${data.enqueued === 1 ? "" : "s"}.`;
+          if (data.errors && data.errors.length) {
+            msg += ` ${data.errors.length} row(s) skipped - bad phone number.`;
+          }
+          bulkUploadStatus.textContent = msg;
+          bulkUploadStatus.className = "flow-save-status ok";
+          renderQueueStatus(data.status);
+          if (data.status.running && !queuePollTimer) pollQueueStatus();
+        } catch (err) {
+          bulkUploadStatus.textContent = "Upload failed: " + err;
+          bulkUploadStatus.className = "flow-save-status err";
+        }
+      });
+
+      queueClearBtn.addEventListener("click", async () => {
+        const res = await fetch("/attrition/calls/queue/clear", { method: "POST" });
+        renderQueueStatus(await res.json());
+      });
+
+      queueResetBtn.addEventListener("click", async () => {
+        const res = await fetch("/attrition/calls/queue/reset", { method: "POST" });
+        renderQueueStatus(await res.json());
+      });
+    }
+  </script>
+</body>
+</html>
