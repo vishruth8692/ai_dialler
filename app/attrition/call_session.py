@@ -74,11 +74,15 @@ class AttritionCallSession:
     opt_out: bool = False
     callback_requested: bool = False
     wrong_person: bool = False
-    # Set when the rider says they're still working or on a break - the NEXT turn (their answer to
-    # the "which store"/"when are you back" follow-up) is closed deterministically rather than
-    # trusting the model to have already closed in the same reply as the follow-up. See
-    # _apply_signal() and handle_user_turn_stream().
+    # Set whenever the just-generated reply asked the rider a genuine follow-up question (still
+    # working/on a break -> "which store"/"when are you back"; busy -> "is a callback OK") - the
+    # NEXT turn (their answer) is closed deterministically rather than trusting the model to have
+    # already closed in the SAME reply as the follow-up (confirmed on real calls it doesn't
+    # reliably do both - see prompts.py's STATUS_GATE text and R12's callback-offer guardrail).
+    # awaiting_close_signal records which original signal triggered it, for accurate debug/monitor
+    # reporting once the call actually closes.
     awaiting_close_ack: bool = False
+    awaiting_close_signal: Optional[str] = None
 
     @property
     def rider_name(self) -> str:
@@ -121,8 +125,12 @@ class AttritionCallSession:
             self.ended = True
             return
         if signal == "busy_callback":
+            # Do NOT end immediately - the reply just generated asks "is a callback OK?" (per R12's
+            # guardrail), a real question the rider hasn't answered yet. Confirmed on a real call
+            # this was ending the call right after asking, before the rider could ever respond.
             self.callback_requested = True
-            self.ended = True
+            self.awaiting_close_ack = True
+            self.awaiting_close_signal = signal
             return
         if signal == "end_call":
             self.ended = True
@@ -133,6 +141,7 @@ class AttritionCallSession:
         if signal in ("still_working", "temporary_break"):
             self.status_gate = signal
             self.awaiting_close_ack = True
+            self.awaiting_close_signal = signal
         elif signal in ("stopped", "never_started"):
             self.status_gate = signal
 
@@ -221,9 +230,11 @@ class AttritionCallSession:
         self.history.append({"role": "user", "content": user_text})
 
         if self.awaiting_close_ack:
-            # The rider just answered the still-working/on-a-break follow-up - close
-            # deterministically here rather than trusting the model to have already closed in the
-            # SAME reply as that follow-up (confirmed on a real call it doesn't reliably do both).
+            # The rider just answered a follow-up question from the previous reply (still
+            # working/on-a-break -> "which store"/"when back", or busy -> "is a callback OK") -
+            # close deterministically here rather than trusting the model to have already closed
+            # in the SAME reply as that follow-up (confirmed on real calls it doesn't reliably do
+            # both, for either case).
             reply_text = prompts.STATUS_GATE_CLOSE_LINE
             yield {"type": "speech_chunk", "text": reply_text}
             yield {"type": "speech_done"}
@@ -234,7 +245,7 @@ class AttritionCallSession:
                 "type": "final",
                 "data": {
                     "user_text": user_text,
-                    "tool_name": self.status_gate,
+                    "tool_name": self.awaiting_close_signal,
                     "answer_summary": user_text,
                     "reply_text": reply_text,
                     "retrieved_context": [],
