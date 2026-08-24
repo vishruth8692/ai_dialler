@@ -4,6 +4,7 @@ functions the live app calls, not a synthetic test.
 Usage: python scripts/benchmark_latency.py [n_runs]
 """
 
+import asyncio
 import statistics
 import sys
 import time
@@ -44,7 +45,7 @@ def main():
         audio_bytes, _ = timed(tts_sarvam.synthesize, text, "english")
 
         session = CallSession()
-        session.greeting()  # one-time call-start cost, excluded from per-turn timing
+        asyncio.run(session.greeting())  # one-time call-start cost, excluded from per-turn timing
 
         t0 = time.perf_counter()
 

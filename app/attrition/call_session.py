@@ -13,9 +13,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
 
-from app.attrition import prompts
+from app.attrition import greeting_prefetch, prompts
 from app.config import ATTRITION_SAFETY_HELPLINE, CLAUDE_MODEL
-from app.llm.claude_client import _shared_async_client, _shared_client
+from app.llm.claude_client import _shared_async_client
 from app.llm.sentence_chunker import SentenceChunker
 
 logger = logging.getLogger(__name__)
@@ -91,14 +91,21 @@ class AttritionCallSession:
     def _system_prompt(self) -> str:
         return prompts.render_system_prompt(self.stage, self.rider_name, ATTRITION_SAFETY_HELPLINE)
 
-    def greeting(self) -> str:
-        response = _shared_client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=200,
-            system=self._system_prompt(),
-            messages=[{"role": "user", "content": "Begin the call."}],
-        )
-        text = "".join(b.text for b in response.content if b.type == "text").strip()
+    async def greeting(self) -> str:
+        # Checks for a greeting already generated speculatively at place-call time (see
+        # greeting_prefetch.py) - overlapping that ~3-5s Claude round-trip with ring/call-setup
+        # time instead of paying it fully after the rider picks up. Falls back to generating fresh
+        # here if nothing was prefetched (e.g. this session wasn't created via the normal
+        # place-call path), so a miss never breaks the call, just costs the latency it always did.
+        text = await greeting_prefetch.take()
+        if text is None:
+            response = await _shared_async_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=200,
+                system=self._system_prompt(),
+                messages=[{"role": "user", "content": "Begin the call."}],
+            )
+            text = "".join(b.text for b in response.content if b.type == "text").strip()
         self.history.append({"role": "assistant", "content": text})
         return text
 

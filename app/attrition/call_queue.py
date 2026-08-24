@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+from app.attrition import greeting_prefetch
 from app.telephony import call_monitor, exotel_client
 
 logger = logging.getLogger(__name__)
@@ -145,6 +146,9 @@ async def _run() -> None:
                 logger.exception("Bulk call to %s failed to place", to_number)
                 _state.done.append({"to_number": to_number, "status": "failed", "error": str(e)})
                 continue
+            # Same overlap-with-ring-time trick as the single "Place a call" form - see
+            # greeting_prefetch.py.
+            greeting_prefetch.start(dial_record.get("rider_name", ""))
 
             started = await _wait_until(active=True, timeout=_MAX_WAIT_FOR_CALL_START_S)
             if not started:

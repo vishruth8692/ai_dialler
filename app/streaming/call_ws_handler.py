@@ -199,14 +199,13 @@ async def _orchestrate(
         await tts.drain_pending(remaining)
 
     t_greeting_start = time.monotonic()
-    # session.greeting() is a synchronous, blocking network call (both CallSession and
-    # AttritionCallSession use the sync Anthropic client for it) - calling it directly here would
-    # stall the ENTIRE event loop for its full duration (confirmed on real calls: 3-4.7s). That
-    # starved the Exotel WS reader task too, so Exotel's 'start' event only ever got processed
-    # AFTER greeting generation finished, not while the phone was still ringing/connecting where
-    # it could have overlapped for free. asyncio.to_thread() keeps the loop free to actually do
-    # that overlapping.
-    greeting_text = await asyncio.to_thread(session.greeting)
+    # session.greeting() is async and uses the async Anthropic client directly (previously a
+    # blocking sync call wrapped in asyncio.to_thread() - confirmed on real calls that stalled the
+    # whole event loop, including the Exotel WS reader task, for the full 3-4.7s round-trip).
+    # AttritionCallSession's greeting() also checks app/attrition/greeting_prefetch.py first, for a
+    # copy generated speculatively at place-call time, overlapping this cost with ring time instead
+    # of paying it after the rider picks up.
+    greeting_text = await session.greeting()
     logger.info("[latency] greeting generation (Claude call): %.2fs", time.monotonic() - t_greeting_start)
     speaking = start_speaking(fixed_text=greeting_text, kind="greeting")
     await outbound_q.put(("json", {"type": "bot_state", "state": "speaking"}))

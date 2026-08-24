@@ -19,6 +19,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from app.attrition import call_queue as attrition_call_queue
+from app.attrition import greeting_prefetch as attrition_greeting_prefetch
 from app.attrition import prompts as attrition_prompts
 from app.attrition import qa_store as attrition_qa_store
 from app.attrition import stage_store as attrition_stage_store
@@ -454,6 +455,9 @@ async def attrition_place_call(
         return RedirectResponse(
             url=f"/attrition?error={quote(f'Call failed: {e}')}", status_code=303
         )
+    # Kick off greeting generation now, in parallel with the phone actually ringing, instead of
+    # waiting until Exotel's WebSocket connects at answer time - see greeting_prefetch.py.
+    attrition_greeting_prefetch.start(rider_name)
 
     call_sid = result.get("Call", {}).get("Sid", "unknown")
     return RedirectResponse(

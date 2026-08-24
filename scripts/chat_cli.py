@@ -5,6 +5,7 @@ Type your replies as if you were the delivery partner (in any of the 5 supported
 Type 'quit' to exit early.
 """
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -26,7 +27,7 @@ def main():
     print(f"Loaded {len(pairs)} question(s). Starting mock call...\n")
 
     session = CallSession()
-    print(f"Bot: {session.greeting()}\n")
+    print(f"Bot: {asyncio.run(session.greeting())}\n")
 
     while not session.ended:
         try:

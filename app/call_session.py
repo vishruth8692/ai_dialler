@@ -101,8 +101,8 @@ class CallSession:
             return self.history.pop()["content"]
         return None
 
-    def greeting(self) -> str:
-        text = self.client.generate_greeting(
+    async def greeting(self) -> str:
+        text = await self.client.generate_greeting(
             first_question=self.current_question, language_hint=self.language_hint
         )
         self.history.append({"role": "assistant", "content": text})

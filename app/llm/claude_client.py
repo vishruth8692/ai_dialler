@@ -77,7 +77,7 @@ class ClaudeClient:
             SYSTEM_PROMPT_TEMPLATE, current_question, retrieved_context, next_question
         )
 
-    def generate_greeting(self, first_question: Optional[dict], language_hint: str) -> str:
+    async def generate_greeting(self, first_question: Optional[dict], language_hint: str) -> str:
         first_q_text = first_question["question"] if first_question else "(no questions loaded)"
         system = (
             "You are a friendly voice assistant calling an Indian delivery partner (rider) to "
@@ -94,7 +94,7 @@ class ClaudeClient:
             "question - be fast, this is a phone call and every extra word costs the rider's time.\n\n"
             f"First question to ask: {first_q_text}"
         )
-        response = self._client.messages.create(
+        response = await self._async_client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=300,
             system=system,
